@@ -1,0 +1,14 @@
+# Netlify config for the standalone (no-build) screener + relay.
+# There is no build step: index.html runs as-is. Netlify just publishes the
+# folder and deploys the function.
+
+[build]
+  publish = "."
+  functions = "netlify/functions"
+
+# Clean URL:  /api/poly  ->  the relay function.
+[[redirects]]
+  from = "/api/poly"
+  to = "/.netlify/functions/poly"
+  status = 200
+  force = true
