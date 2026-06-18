@@ -18,30 +18,24 @@
 "use strict";
 const { useState, useEffect, useCallback, useRef } = React;
 // ════════════════════════════════════════════════════════════════════════════
-// POLYMARKET API REFERENCE (verified against docs.polymarket.com, June 2026)
+// POLYMARKET INSIDER SCREENER — data-api only build
 // ────────────────────────────────────────────────────────────────────────────
-//  data-api.polymarket.com  → trades, positions, activity, holders (NO AUTH)
-//  gamma-api.polymarket.com → markets, events, tags, search        (NO AUTH)
-//  clob.polymarket.com      → orderbook, prices, order management  (auth for trading)
-//
-//  GET /trades params: limit, offset, takerOnly, filterType(CASH|TOKENS),
-//                       filterAmount, market, eventId, user, side(BUY|SELL)
-//  Trade fields: proxyWallet, side, asset, conditionId, size(=SHARES, not $),
-//                price, timestamp, title, slug, eventSlug, outcome, outcomeIndex
-//
-//  GET /markets params include condition_ids (CSV), closed(bool, default false)
-//  Market fields: conditionId, endDate/endDateIso, closed,
-//                 outcomes & outcomePrices are JSON-ENCODED STRINGS, not arrays
+// Verified against real API responses (June 2026):
+//  /trades   → live feed. Each trade ALREADY has title, slug, outcome,
+//              conditionId, price, size (= SHARE COUNT). Cash = price × size.
+//  /positions?user=ADDR → per-wallet holdings, each with cashPnl, redeemable,
+//              endDate, conditionId. Gives win-rate AND market end-dates WITHOUT
+//              the gamma API (which returned 500s for every market lookup).
+//  All fetches are DIRECT to data-api.polymarket.com. Relay, public CORS
+//  proxies, and gamma calls removed — they were the source of every failure.
+//  Privacy Bridge & Wallet Age need Polygonscan → remain manual (row links).
 // ════════════════════════════════════════════════════════════════════════════
 const DA = "https://data-api.polymarket.com";
-const GM = "https://gamma-api.polymarket.com";
-// ── Design tokens ──────────────────────────────────────────────────────────────
 const T = {
     bg: "#07080F", panel: "#0C1120", bdr: "#162032", text: "#E2EAF8",
     muted: "#56687A", dim: "#283848", mono: "'Courier New', monospace",
     s: "#F97316", a: "#38BDF8", ok: "#4ADE80",
 };
-// ── Risk tiers ─────────────────────────────────────────────────────────────────
 const RISK = [
     { min: 80, label: "CRITICAL", c: "#FF3B3B", bg: "rgba(255,59,59,.09)", bd: "rgba(255,59,59,.28)" },
     { min: 60, label: "HIGH", c: "#FF7A2F", bg: "rgba(255,122,47,.09)", bd: "rgba(255,122,47,.28)" },
@@ -50,7 +44,6 @@ const RISK = [
     { min: 0, label: "MINIMAL", c: "#34D399", bg: "rgba(52,211,153,.09)", bd: "rgba(52,211,153,.28)" },
 ];
 const getR = s => RISK.find(r => s >= r.min) || RISK[4];
-// ── Scoring ────────────────────────────────────────────────────────────────────
 const scoreOdds = p => {
     if (!p || p <= 0)
         return 0;
@@ -66,7 +59,7 @@ const scoreOdds = p => {
 };
 const scoreTiming = h => {
     if (h === null || h === undefined || h < 0)
-        return 0;
+        return null;
     if (h < 6)
         return 22;
     if (h < 24)
@@ -89,148 +82,62 @@ const scoreWR = (w, t) => {
         return 2;
     return 0;
 };
-const scoreDorm = after => {
-    if (after === null || after === undefined)
+const scoreDorm = a => {
+    if (a === null || a === undefined)
         return null;
-    if (after === 0)
+    if (a === 0)
         return 7;
-    if (after < 2)
+    if (a < 2)
         return 4;
     return 0;
 };
-// ── Fetch helpers ──────────────────────────────────────────────────────────────
-// Polymarket's data/gamma APIs send CORS headers scoped to their own frontend,
-// so a direct browser call from any other origin (this sandbox, localhost, a
-// deployed site on a different domain) is blocked by the browser BEFORE it ever
-// reaches Polymarket. The standard fix is a CORS proxy: a server that makes the
-// request for us and re-serves it with Access-Control-Allow-Origin: *.
-// We try direct first (works if you later run behind your own server/Vite proxy),
-// then fall through public CORS proxies. First strategy to succeed wins.
-const PROXIES = [
-    null, // direct (same-origin if behind your own relay/Vite proxy)
-    // direct (same-origin if behind your own relay/Vite proxy)
-    u => `/api/poly?url=${encodeURIComponent(u)}`, // your Netlify/CF relay (preferred; inert until deployed)
-    // your Netlify/CF relay (preferred; inert until deployed)
-    u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`, // public proxy 1 (fallback)
-    // public proxy 1 (fallback)
-    u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`, // public proxy 2 (fallback)
-];
-const PROXY_LABELS = ["direct", "relay", "allorigins", "corsproxy"];
-let PROXY_USED = null; // remembers which strategy worked, for the status line
 const jFetch = async (url) => {
-    let lastErr;
-    for (let i = 0; i < PROXIES.length; i++) {
-        const target = PROXIES[i] ? PROXIES[i](url) : url;
-        try {
-            const r = await fetch(target, { headers: { Accept: "application/json" } });
-            if (!r.ok) {
-                lastErr = new Error(`HTTP ${r.status}`);
-                continue;
-            }
-            const data = await r.json();
-            PROXY_USED = PROXY_LABELS[i] || `route ${i}`;
-            return data;
-        }
-        catch (e) {
-            lastErr = e;
-        }
-    }
-    throw lastErr || new Error("All fetch strategies (direct + proxies) failed");
+    const r = await fetch(url, { headers: { Accept: "application/json" } });
+    if (!r.ok)
+        throw new Error(`HTTP ${r.status}`);
+    return r.json();
 };
 const isNetworkBlock = e => {
     const m = String((e === null || e === void 0 ? void 0 : e.message) || e);
     return m.includes("Failed to fetch") || m.includes("NetworkError") ||
         m.includes("Load failed") || m.includes("fetch failed");
 };
-// Unix seconds vs milliseconds heuristic (ms epoch now ≈ 1.78e12, seconds ≈ 1.78e9)
-const normalizeTs = t => {
+const tsToDate = t => {
+    if (t === null || t === undefined || t === "")
+        return null;
+    if (typeof t === "string" && /[-T:]/.test(t)) {
+        const d = new Date(t);
+        return isNaN(d) ? null : d;
+    }
     const n = Number(t);
     if (!n)
         return null;
     return new Date(n > 1e12 ? n : n * 1000);
 };
-const safeJsonArr = s => {
-    if (Array.isArray(s))
-        return s;
-    if (typeof s !== "string")
-        return null;
-    try {
-        const p = JSON.parse(s);
-        return Array.isArray(p) ? p : null;
-    }
-    catch (_a) {
-        return null;
-    }
-};
-const chunk = (arr, n) => {
-    const out = [];
-    for (let i = 0; i < arr.length; i += n)
-        out.push(arr.slice(i, i + n));
-    return out;
-};
-// ── Parsers (matches verified API schema) ──────────────────────────────────────
-// NOTE: trade "size" is SHARE COUNT, not dollars. Dollar notional = price × size.
-// We store that notional in `.size` below so the rest of the UI can treat it as $.
 const parseTrade = r => {
     const price = parseFloat(r.price || 0);
     const shares = parseFloat(r.size || 0);
     return {
-        id: r.transactionHash || `${r.proxyWallet || "?"}-${r.conditionId || "?"}-${r.timestamp || Math.random()}`,
+        id: r.transactionHash || `${r.proxyWallet}-${r.conditionId}-${r.timestamp}`,
         addr: r.proxyWallet || "",
         conditionId: r.conditionId || "",
-        ts: normalizeTs(r.timestamp),
-        price,
-        shares,
-        size: price * shares, // dollar notional, used as "$ size" everywhere below
+        ts: tsToDate(r.timestamp),
+        price, shares, cash: price * shares,
         side: (r.side || "BUY").toUpperCase(),
         outcome: r.outcome || "",
         title: r.title || "",
-        slug: r.slug || "",
+        slug: r.slug || r.eventSlug || "",
     };
 };
-const parseMkt = r => ({
-    question: r.question || "",
-    endDate: r.endDate ? new Date(r.endDate) : (r.endDateIso ? new Date(r.endDateIso) : null),
-    closed: !!r.closed,
-    outcomes: safeJsonArr(r.outcomes) || ["Yes", "No"],
-    outcomePrices: (safeJsonArr(r.outcomePrices) || ["0.5", "0.5"]).map(parseFloat),
-    slug: r.slug || "",
-});
-const didWin = (t, m) => {
-    if (!(m === null || m === void 0 ? void 0 : m.closed))
-        return null;
-    const i = m.outcomes.findIndex(o => o.toLowerCase() === (t.outcome || "").toLowerCase());
-    return i === -1 ? null : m.outcomePrices[i] > 0.5;
-};
-const preSusp = t => scoreOdds(t.price * 100) + (t.size > 5000 ? 3 : t.size > 1000 ? 1 : 0);
-// Fetch market metadata for a batch of conditionIds. Gamma's `closed` filter
-// defaults to false, which would silently drop resolved markets — so we query
-// both closed states explicitly and merge, guaranteeing full coverage.
-// Chunked at 50 (gamma's condition_ids ceiling is ~100) and the caller caps the
-// id count, so total proxied market calls stay small even on a big scan.
-const fetchMarketsByConditionIds = async (ids) => {
-    const unique = [...new Set(ids)].filter(Boolean);
-    if (!unique.length)
-        return {};
-    const batches = chunk(unique, 50);
-    const map = {};
-    const calls = batches.flatMap(b => {
-        const csv = b.join(",");
-        return [
-            jFetch(`${GM}/markets?condition_ids=${csv}&closed=false&limit=${b.length}`),
-            jFetch(`${GM}/markets?condition_ids=${csv}&closed=true&limit=${b.length}`),
-        ];
+const parsePosition = r => {
+    var _a;
+    return ({
+        conditionId: r.conditionId || "",
+        cashPnl: parseFloat((_a = r.cashPnl) !== null && _a !== void 0 ? _a : 0),
+        redeemable: !!r.redeemable,
+        endDate: tsToDate(r.endDate),
     });
-    const results = await Promise.allSettled(calls);
-    results.forEach(res => {
-        if (res.status === "fulfilled" && Array.isArray(res.value)) {
-            res.value.forEach(m => { if (m === null || m === void 0 ? void 0 : m.conditionId)
-                map[m.conditionId] = parseMkt(m); });
-        }
-    });
-    return map;
 };
-// ── Pulsing dot — signature element ───────────────────────────────────────────
 function Dot({ color, size = 7 }) {
     return (React.createElement("div", { style: { position: "relative", width: size, height: size, flexShrink: 0 } },
         React.createElement("div", { style: { position: "absolute", inset: 0, borderRadius: "50%",
@@ -243,45 +150,40 @@ function RBadge({ score }) {
             background: r.bg, border: `1px solid ${r.bd}`,
             padding: "2px 5px", borderRadius: 3, whiteSpace: "nowrap" } }, r.label));
 }
-function MiniBar({ label, tier, pts, max }) {
+function MiniBar({ label, tier, pts, max, naText }) {
     const tc = tier === "S" ? T.s : T.a;
-    if (pts === null)
-        return (React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 7 } },
+    if (pts === null || pts === undefined)
+        return (React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 } },
             React.createElement("div", { style: { display: "flex", gap: 5, alignItems: "center" } },
-                React.createElement("span", { style: { fontSize: 7, color: tc, background: `${tc}18`, fontFamily: T.mono,
-                        padding: "1px 3px", borderRadius: 2 } }, tier),
+                React.createElement("span", { style: { fontSize: 7, color: tc, background: `${tc}18`, fontFamily: T.mono, padding: "1px 3px", borderRadius: 2 } }, tier),
                 React.createElement("span", { style: { fontSize: 11, color: T.muted } }, label)),
-            React.createElement("span", { style: { fontSize: 9, color: T.dim } }, "\u2014")));
+            React.createElement("span", { style: { fontSize: 9, color: T.dim, fontStyle: "italic" } }, naText || "n/a")));
     const pct = max > 0 ? (pts / max) * 100 : 0;
     return (React.createElement("div", { style: { marginBottom: 9 } },
         React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 } },
             React.createElement("div", { style: { display: "flex", gap: 5, alignItems: "center" } },
-                React.createElement("span", { style: { fontSize: 7, color: tc, background: `${tc}18`, fontFamily: T.mono,
-                        padding: "1px 3px", borderRadius: 2 } }, tier),
+                React.createElement("span", { style: { fontSize: 7, color: tc, background: `${tc}18`, fontFamily: T.mono, padding: "1px 3px", borderRadius: 2 } }, tier),
                 React.createElement("span", { style: { fontSize: 11, color: pts > 0 ? "#C8DCE8" : T.muted } }, label)),
-            React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, fontWeight: 600,
-                    color: pts > 0 ? tc : T.dim } },
+            React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, fontWeight: 600, color: pts > 0 ? tc : T.dim } },
                 pts,
                 "/",
                 max)),
         React.createElement("div", { style: { height: 3, background: T.bg, borderRadius: 2, overflow: "hidden" } },
             React.createElement("div", { style: { height: "100%", width: `${pct}%`, borderRadius: 2,
-                    background: pts > 0 ? `linear-gradient(90deg,${tc}55,${tc})` : "#16243A",
-                    transition: "width .5s ease" } }))));
+                    background: pts > 0 ? `linear-gradient(90deg,${tc}55,${tc})` : "#16243A", transition: "width .5s ease" } }))));
 }
-// ── Feed row ───────────────────────────────────────────────────────────────────
 function FeedRow({ item, isNew, expanded, onToggle }) {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _j;
+    var _a, _b, _c, _d, _e, _f;
     const score = (_a = item.fullScore) !== null && _a !== void 0 ? _a : item.quickScore;
     const maxScore = (_b = item.fullMax) !== null && _b !== void 0 ? _b : item.quickMax;
     const rk = getR(score);
     const pct = (item.price * 100).toFixed(1);
     const isLowOdds = parseFloat(pct) < 20;
     const hrsFmt = item.hours != null
-        ? item.hours < 24 ? `${item.hours.toFixed(1)}h` : `${(item.hours / 24).toFixed(1)}d`
-        : "—";
+        ? (item.hours < 24 ? `${item.hours.toFixed(1)}h` : `${(item.hours / 24).toFixed(1)}d`)
+        : (item.enriched ? "—" : "·");
     const hrsColor = item.hours != null
-        ? item.hours < 6 ? "#FF3B3B" : item.hours < 24 ? "#FF7A2F" : item.hours < 72 ? T.a : T.dim
+        ? (item.hours < 6 ? "#FF3B3B" : item.hours < 24 ? "#FF7A2F" : item.hours < 72 ? T.a : T.dim)
         : T.dim;
     return (React.createElement(React.Fragment, null,
         React.createElement("tr", { onClick: onToggle, style: {
@@ -299,179 +201,161 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                     "/",
                     maxScore),
                 item.enriched && React.createElement("span", { style: { marginLeft: 4, fontSize: 8, color: T.ok }, title: "Wallet enriched" }, "\u2713"),
-                item.enriching && React.createElement("span", { style: { marginLeft: 4, fontSize: 9, color: T.a,
-                        display: "inline-block", animation: "spin .8s linear infinite" } }, "\u21BB")),
+                item.enriching && React.createElement("span", { style: { marginLeft: 4, fontSize: 9, color: T.a, display: "inline-block", animation: "spin .8s linear infinite" } }, "\u21BB")),
             React.createElement("td", { style: { padding: "10px 8px" } },
                 React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, color: "#4A9ABB" } }, item.addr ? `${item.addr.slice(0, 6)}…${item.addr.slice(-4)}` : "—")),
             React.createElement("td", { style: { padding: "10px 8px" } },
-                React.createElement("div", { style: { fontSize: 11, color: T.muted, overflow: "hidden",
-                        textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 260 } }, item.title || ((_c = item.mkt) === null || _c === void 0 ? void 0 : _c.question) || `${item.conditionId.slice(0, 28)}…`)),
+                React.createElement("div", { style: { fontSize: 11, color: T.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 260 } }, item.title || `${item.conditionId.slice(0, 28)}…`)),
             React.createElement("td", { style: { padding: "10px 8px" } },
-                React.createElement("span", { style: { fontFamily: T.mono, fontSize: 12, fontWeight: 700,
-                        color: isLowOdds ? T.s : T.a } },
+                React.createElement("span", { style: { fontFamily: T.mono, fontSize: 12, fontWeight: 700, color: isLowOdds ? T.s : T.a } },
                     pct,
                     "%")),
             React.createElement("td", { style: { padding: "10px 8px" } },
                 React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, color: T.text } },
                     "$",
-                    item.size.toLocaleString(undefined, { maximumFractionDigits: 0 }))),
+                    item.cash.toLocaleString(undefined, { maximumFractionDigits: 0 }))),
             React.createElement("td", { style: { padding: "10px 8px" } },
                 React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, color: hrsColor } }, hrsFmt)),
             React.createElement("td", { style: { padding: "10px 12px 10px 8px" } }, item.outcome
                 ? React.createElement("span", { style: { fontSize: 10, fontWeight: 700,
-                        color: item.outcome.toLowerCase() === "yes" ? T.ok : "#F87171" } }, item.outcome.toUpperCase())
+                        color: item.outcome.toLowerCase() === "yes" ? T.ok : item.outcome.toLowerCase() === "no" ? "#F87171" : T.a } }, item.outcome.toUpperCase())
                 : React.createElement("span", { style: { color: T.dim, fontSize: 10 } }, "\u2014"))),
         expanded && (React.createElement("tr", { style: { background: `${rk.c}04`, borderBottom: `1px solid ${T.bdr}` } },
             React.createElement("td", { colSpan: 9, style: { padding: "16px 20px 18px" } },
                 React.createElement("div", { style: { display: "flex", gap: 28, flexWrap: "wrap" } },
                     React.createElement("div", { style: { minWidth: 250, flex: 1 } },
                         React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 11 } }, "SIGNAL BREAKDOWN"),
-                        React.createElement("div", { style: { fontSize: 8, color: T.s, letterSpacing: 1.5, fontWeight: 700,
-                                background: `${T.s}12`, padding: "2px 6px", borderRadius: 3,
-                                display: "inline-block", marginBottom: 9 } }, "S-TIER \u00B7 AUTO-COMPUTED"),
-                        React.createElement(MiniBar, { label: "Entry Odds Level", tier: "S", pts: (_d = item.sig_odds) !== null && _d !== void 0 ? _d : 0, max: 18 }),
-                        React.createElement(MiniBar, { label: "Pre-Resolution Timing", tier: "S", pts: (_e = item.sig_time) !== null && _e !== void 0 ? _e : 0, max: 22 }),
-                        React.createElement(MiniBar, { label: "Privacy Bridge Origin", tier: "S", pts: null, max: 25 }),
+                        React.createElement("div", { style: { fontSize: 8, color: T.s, letterSpacing: 1.5, fontWeight: 700, background: `${T.s}12`, padding: "2px 6px", borderRadius: 3, display: "inline-block", marginBottom: 9 } }, "S-TIER"),
+                        React.createElement(MiniBar, { label: "Entry Odds Level", tier: "S", pts: (_c = item.sig_odds) !== null && _c !== void 0 ? _c : 0, max: 18 }),
+                        React.createElement(MiniBar, { label: "Pre-Resolution Timing", tier: "S", pts: item.sig_time, max: 22, naText: item.enriched ? "no resolved date" : "enriching…" }),
+                        React.createElement(MiniBar, { label: "Privacy Bridge Origin", tier: "S", pts: null, max: 25, naText: "manual \u2193" }),
                         React.createElement("div", { style: { height: 1, background: T.bdr, margin: "9px 0" } }),
-                        React.createElement("div", { style: { fontSize: 8, color: T.a, letterSpacing: 1.5, fontWeight: 700,
-                                background: `${T.a}10`, padding: "2px 6px", borderRadius: 3,
-                                display: "inline-block", marginBottom: 9 } }, "A-TIER \u00B7 WALLET DATA"),
-                        React.createElement(MiniBar, { label: "Historical Win Rate", tier: "A", pts: item.sig_wr, max: 6 }),
-                        React.createElement(MiniBar, { label: "Post-Resolution Dormancy", tier: "A", pts: item.sig_dorm, max: 7 }),
-                        React.createElement(MiniBar, { label: "Wallet Age (WC\u00B7TX)", tier: "A", pts: null, max: 10 }),
-                        React.createElement(MiniBar, { label: "Multi-Wallet Coordination", tier: "A", pts: null, max: 12 })),
+                        React.createElement("div", { style: { fontSize: 8, color: T.a, letterSpacing: 1.5, fontWeight: 700, background: `${T.a}10`, padding: "2px 6px", borderRadius: 3, display: "inline-block", marginBottom: 9 } }, "A-TIER"),
+                        React.createElement(MiniBar, { label: "Historical Win Rate", tier: "A", pts: item.sig_wr, max: 6, naText: item.enriching ? "enriching…" : "<3 resolved" }),
+                        React.createElement(MiniBar, { label: "Post-Resolution Dormancy", tier: "A", pts: item.sig_dorm, max: 7, naText: item.enriching ? "enriching…" : "n/a" }),
+                        React.createElement(MiniBar, { label: "Wallet Age (WC\u00B7TX)", tier: "A", pts: null, max: 10, naText: "manual \u2193" }),
+                        React.createElement(MiniBar, { label: "Multi-Wallet Coord.", tier: "A", pts: null, max: 12, naText: "manual \u2193" })),
                     React.createElement("div", { style: { minWidth: 180 } },
                         React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 11 } }, "WALLET SNAPSHOT"),
                         item.enriching && (React.createElement("div", { style: { fontSize: 10, color: T.a, display: "flex", gap: 6, alignItems: "center" } },
                             React.createElement("span", { style: { display: "inline-block", animation: "spin .8s linear infinite" } }, "\u21BB"),
-                            "Loading wallet history\u2026")),
+                            " Loading positions\u2026")),
                         item.enriched && (React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "7px 18px" } }, [
-                            ["Resolved bets", (_f = item.w_resolved) !== null && _f !== void 0 ? _f : "—"],
-                            ["Wins", (_g = item.w_wins) !== null && _g !== void 0 ? _g : "—"],
-                            ["Win rate", item.w_resolved > 0
-                                    ? `${((item.w_wins / item.w_resolved) * 100).toFixed(0)}%` : "—"],
-                            ["Post-win activity", item.w_stillActive != null
-                                    ? (item.w_stillActive ? "Yes" : "No 🔴") : "—"],
+                            ["Resolved bets", (_d = item.w_resolved) !== null && _d !== void 0 ? _d : "—"],
+                            ["Wins", (_e = item.w_wins) !== null && _e !== void 0 ? _e : "—"],
+                            ["Win rate", item.w_resolved > 0 ? `${((item.w_wins / item.w_resolved) * 100).toFixed(0)}%` : "—"],
+                            ["Total P&L", item.w_pnl != null ? `${item.w_pnl >= 0 ? "+" : ""}$${item.w_pnl.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : "—"],
+                            ["Mkt resolves", item.endDate ? item.endDate.toLocaleDateString() : "—"],
+                            ["Open positions", (_f = item.w_open) !== null && _f !== void 0 ? _f : "—"],
                         ].map(([k, v]) => (React.createElement("div", { key: k },
                             React.createElement("div", { style: { fontSize: 9, color: T.dim, marginBottom: 2 } }, k),
-                            React.createElement("div", { style: { fontSize: 11, fontFamily: T.mono, color: T.text } }, v)))))),
+                            React.createElement("div", { style: { fontSize: 11, fontFamily: T.mono,
+                                    color: k === "Total P&L" && item.w_pnl != null ? (item.w_pnl >= 0 ? T.ok : "#F87171") : T.text } }, v)))))),
                         !item.enriched && !item.enriching && (React.createElement("div", { style: { fontSize: 10, color: T.dim, lineHeight: 1.7 } },
-                            "Top 3 trades auto-enrich.",
+                            "Top 4 auto-enrich.",
                             React.createElement("br", null),
-                            "Click again after a moment to load wallet stats."))),
+                            "Click again in a moment for wallet stats."))),
                     React.createElement("div", { style: { minWidth: 200 } },
                         React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 11 } }, "LINKS & MANUAL CHECKS"),
                         React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 7, marginBottom: 14 } },
-                            React.createElement("a", { href: `https://polygonscan.com/address/${item.addr}#tokentxns`, target: "_blank", rel: "noopener noreferrer", style: { fontSize: 10, color: T.a, textDecoration: "none", display: "flex",
-                                    alignItems: "center", justifyContent: "space-between",
-                                    padding: "6px 10px", border: "1px solid rgba(56,189,248,.2)", borderRadius: 5 } },
+                            React.createElement("a", { href: `https://polygonscan.com/address/${item.addr}#tokentxns`, target: "_blank", rel: "noopener noreferrer", style: { fontSize: 10, color: T.a, textDecoration: "none", display: "flex", justifyContent: "space-between", padding: "6px 10px", border: "1px solid rgba(56,189,248,.2)", borderRadius: 5 } },
                                 React.createElement("span", null, "Check funding source"),
                                 React.createElement("span", { style: { opacity: .6 } }, "Polygonscan \u2197")),
-                            (item.slug || ((_h = item.mkt) === null || _h === void 0 ? void 0 : _h.slug)) && (React.createElement("a", { href: `https://polymarket.com/event/${item.slug || ((_j = item.mkt) === null || _j === void 0 ? void 0 : _j.slug)}`, target: "_blank", rel: "noopener noreferrer", style: { fontSize: 10, color: T.muted, textDecoration: "none", display: "flex",
-                                    alignItems: "center", justifyContent: "space-between",
-                                    padding: "6px 10px", border: `1px solid ${T.bdr}`, borderRadius: 5 } },
+                            item.slug && (React.createElement("a", { href: `https://polymarket.com/event/${item.slug}`, target: "_blank", rel: "noopener noreferrer", style: { fontSize: 10, color: T.muted, textDecoration: "none", display: "flex", justifyContent: "space-between", padding: "6px 10px", border: `1px solid ${T.bdr}`, borderRadius: 5 } },
                                 React.createElement("span", null, "View this market"),
                                 React.createElement("span", { style: { opacity: .6 } }, "Polymarket \u2197"))),
-                            React.createElement("a", { href: `https://polygonscan.com/address/${item.addr}`, target: "_blank", rel: "noopener noreferrer", style: { fontSize: 10, color: T.muted, textDecoration: "none", display: "flex",
-                                    alignItems: "center", justifyContent: "space-between",
-                                    padding: "6px 10px", border: `1px solid ${T.bdr}`, borderRadius: 5 } },
+                            React.createElement("a", { href: `https://polygonscan.com/address/${item.addr}`, target: "_blank", rel: "noopener noreferrer", style: { fontSize: 10, color: T.muted, textDecoration: "none", display: "flex", justifyContent: "space-between", padding: "6px 10px", border: `1px solid ${T.bdr}`, borderRadius: 5 } },
                                 React.createElement("span", null, "Full wallet on-chain"),
                                 React.createElement("span", { style: { opacity: .6 } }, "Polygonscan \u2197"))),
                         React.createElement("div", { style: { fontSize: 9, color: T.dim, lineHeight: 1.8 } },
-                            React.createElement("span", { style: { color: "#C0480A" } }, "\u25CF Privacy Bridge (25 pts):"),
-                            " Look for Railgun contract inflows",
+                            React.createElement("span", { style: { color: "#C0480A" } }, "\u25CF Privacy Bridge (25):"),
+                            " Railgun inflows on Polygonscan",
                             React.createElement("br", null),
-                            React.createElement("span", { style: { color: "#1E6490" } }, "\u25CF Multi-Wallet (12 pts):"),
+                            React.createElement("span", { style: { color: "#1E6490" } }, "\u25CF Wallet Age (10):"),
+                            " Gap from wallet creation to first trade",
+                            React.createElement("br", null),
+                            React.createElement("span", { style: { color: "#1E6490" } }, "\u25CF Multi-Wallet (12):"),
                             " Same funder, same side, same market"))))))));
 }
-function Steps({ current }) {
+function Steps({ phase }) {
     const LIST = [
-        ["trades", "Fetching recent BUY trades from data-api.polymarket.com"],
-        ["markets", "Resolving market end-dates & outcomes from gamma-api.polymarket.com"],
-        ["scoring", "Computing insider signal scores"],
+        ["trades", "Fetching recent trades from data-api"],
+        ["scoring", "Scoring entry odds + cash size"],
+        ["enrich", "Loading top wallets' positions (win rate + timing)"],
     ];
-    const idx = LIST.findIndex(([id]) => id === current);
+    const idx = LIST.findIndex(([id]) => id === phase);
     return (React.createElement("div", { style: { display: "inline-block", textAlign: "left" } }, LIST.map(([, label], i) => (React.createElement("div", { key: i, style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 10 } },
         React.createElement("div", { style: { width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
-                background: i < idx ? T.ok : i === idx ? T.a : T.dim,
-                boxShadow: i === idx ? `0 0 8px ${T.a}` : "none" } }),
+                background: i < idx ? T.ok : i === idx ? T.a : T.dim, boxShadow: i === idx ? `0 0 8px ${T.a}` : "none" } }),
         React.createElement("span", { style: { fontSize: 11, color: i < idx ? T.ok : i === idx ? T.text : T.dim } }, label))))));
 }
-// ── App ────────────────────────────────────────────────────────────────────────
 function App() {
-    const [minSize, setMinSize] = useState(1000);
-    const [minScore, setMinScore] = useState(8);
+    const [minCash, setMinCash] = useState(1000);
+    const [minScore, setMinScore] = useState(5);
     const [autoRef, setAutoRef] = useState(true);
     const [showCtrl, setShowCtrl] = useState(false);
     const [sortBy, setSortBy] = useState("score");
     const [feed, setFeed] = useState([]);
-    const [phase, setPhase] = useState("trades"); // trades|markets|scoring|done|err
+    const [phase, setPhase] = useState("trades");
     const [fetched, setFetched] = useState(0);
     const [lastUpd, setLastUpd] = useState(null);
     const [expanded, setExpanded] = useState(new Set());
     const [newIds, setNewIds] = useState(new Set());
     const [errMsg, setErrMsg] = useState("");
-    const mktCache = useRef({});
-    const wCache = useRef({});
+    const posCache = useRef({});
     const prevIds = useRef(new Set());
     const timerRef = useRef(null);
     const scanningR = useRef(false);
-    const minSizeR = useRef(minSize);
+    const minCashR = useRef(minCash);
     const minScoreR = useRef(minScore);
-    useEffect(() => { minSizeR.current = minSize; }, [minSize]);
+    useEffect(() => { minCashR.current = minCash; }, [minCash]);
     useEffect(() => { minScoreR.current = minScore; }, [minScore]);
-    const scanning = ["trades", "markets", "scoring"].includes(phase) && scanningR.current;
-    // ── Enrich one wallet with trade history (win rate + dormancy) ─────────────
+    const scanning = ["trades", "scoring", "enrich"].includes(phase) && scanningR.current;
     const enrich = useCallback(async (item) => {
         if (!item.addr)
             return;
-        if (wCache.current[item.addr]) {
-            const w = wCache.current[item.addr];
-            setFeed(prev => prev.map(r => {
-                var _a;
-                return r.id !== item.id ? r : {
-                    ...r, ...w, enriched: true, enriching: false,
-                    fullScore: r.quickScore + (w.sig_wr || 0) + ((_a = w.sig_dorm) !== null && _a !== void 0 ? _a : 0),
-                    fullMax: r.quickMax + 13,
-                };
-            }));
+        const apply = (w) => setFeed(prev => prev.map(r => {
+            if (r.id !== item.id)
+                return r;
+            const pos = w.byCondition[r.conditionId];
+            const endDate = (pos === null || pos === void 0 ? void 0 : pos.endDate) || null;
+            const hours = endDate && r.ts ? (endDate - r.ts) / 3600000 : null;
+            const sig_time = scoreTiming(hours);
+            const sig_wr = scoreWR(w.wins, w.resolved);
+            const sig_dorm = scoreDorm(w.afterWin);
+            const parts = [r.sig_odds, sig_time, sig_wr, sig_dorm].filter(x => x !== null && x !== undefined);
+            const maxParts = 18 + (sig_time !== null ? 22 : 0) + 6 + (sig_dorm !== null ? 7 : 0);
+            return {
+                ...r, endDate, hours, sig_time, sig_wr, sig_dorm,
+                w_wins: w.wins, w_resolved: w.resolved, w_pnl: w.pnl, w_open: w.open,
+                fullScore: parts.reduce((a, b) => a + b, 0), fullMax: maxParts,
+                enriched: true, enriching: false,
+            };
+        }));
+        if (posCache.current[item.addr]) {
+            apply(posCache.current[item.addr]);
             return;
         }
         setFeed(prev => prev.map(r => r.id === item.id ? { ...r, enriching: true } : r));
         try {
-            const raw = await jFetch(`${DA}/trades?user=${item.addr}&side=BUY&limit=100`);
-            const wTrades = Array.isArray(raw) ? raw.map(parseTrade) : [];
-            // Cap market lookups to the 50 most recent positions to limit proxy calls.
-            const wIds = wTrades.map(t => t.conditionId).filter(id => !mktCache.current[id]).slice(0, 50);
-            const fetched = await fetchMarketsByConditionIds(wIds);
-            Object.assign(mktCache.current, fetched);
-            const resolved = wTrades.filter(t => { var _a; return (_a = mktCache.current[t.conditionId]) === null || _a === void 0 ? void 0 : _a.closed; });
-            const wins = resolved.filter(t => didWin(t, mktCache.current[t.conditionId]) === true).length;
-            const resTimes = resolved.map(t => t.ts).filter(Boolean).sort((a, b) => b - a);
-            const afterWin = resTimes.length > 0
-                ? wTrades.filter(t => t.ts && t.ts > resTimes[0]).length
-                : null;
-            const sig_wr = scoreWR(wins, resolved.length);
-            const sig_dorm = scoreDorm(afterWin);
-            const wData = {
-                sig_wr, sig_dorm,
-                w_resolved: resolved.length, w_wins: wins,
-                w_stillActive: afterWin !== null ? afterWin > 1 : null,
-                enriched: true, enriching: false,
-            };
-            wCache.current[item.addr] = wData;
-            setFeed(prev => prev.map(r => r.id !== item.id ? r : {
-                ...r, ...wData,
-                fullScore: r.quickScore + sig_wr + (sig_dorm !== null && sig_dorm !== void 0 ? sig_dorm : 0),
-                fullMax: r.quickMax + 13,
-            }));
+            const raw = await jFetch(`${DA}/positions?user=${item.addr}&limit=200`);
+            const positions = Array.isArray(raw) ? raw.map(parsePosition) : [];
+            const resolvedPos = positions.filter(p => p.redeemable);
+            const wins = resolvedPos.filter(p => p.cashPnl > 0).length;
+            const pnl = positions.reduce((a, p) => a + (p.cashPnl || 0), 0);
+            const open = positions.length - resolvedPos.length;
+            const afterWin = resolvedPos.length > 0 ? open : null;
+            const byCondition = {};
+            positions.forEach(p => { if (p.conditionId)
+                byCondition[p.conditionId] = p; });
+            const w = { wins, resolved: resolvedPos.length, pnl, open, afterWin, byCondition };
+            posCache.current[item.addr] = w;
+            apply(w);
         }
         catch (_a) {
-            setFeed(prev => prev.map(r => r.id === item.id
-                ? { ...r, enriching: false, enriched: false } : r));
+            setFeed(prev => prev.map(r => r.id === item.id ? { ...r, enriching: false, enriched: false } : r));
         }
     }, []);
-    // ── Main scan ───────────────────────────────────────────────────────────────
     const scan = useCallback(async () => {
         if (scanningR.current)
             return;
@@ -479,54 +363,43 @@ function App() {
         setErrMsg("");
         setPhase("trades");
         try {
-            const url = `${DA}/trades?limit=200&side=BUY&filterType=CASH&filterAmount=${minSizeR.current}`;
-            const raw = await jFetch(url);
+            const raw = await jFetch(`${DA}/trades?limit=500&takerOnly=true`);
             if (!Array.isArray(raw))
-                throw new Error("Unexpected response shape from Polymarket API.");
-            const trades = raw.map(parseTrade)
-                .filter(t => t.addr && t.conditionId && t.size >= minSizeR.current); // belt-and-suspenders
-            setFetched(trades.length);
-            setPhase("markets");
-            // Trades arrive most-recent-first; cap market lookups to the latest 100
-            // so the number of proxied gamma calls stays small (≤4) even on a big scan.
-            const needed = trades.slice(0, 100)
-                .map(t => t.conditionId).filter(id => !mktCache.current[id]);
-            const fetchedMkts = await fetchMarketsByConditionIds(needed);
-            Object.assign(mktCache.current, fetchedMkts);
+                throw new Error("Unexpected response from data-api.");
             setPhase("scoring");
+            const trades = raw.map(parseTrade).filter(t => t.side === "BUY" && t.addr && t.conditionId && t.cash >= minCashR.current);
+            setFetched(raw.length);
             const scored = trades.map(t => {
-                const m = mktCache.current[t.conditionId] || null;
-                const hours = (m === null || m === void 0 ? void 0 : m.endDate) && t.ts ? (m.endDate - t.ts) / 3600000 : null;
                 const sig_odds = scoreOdds(t.price * 100);
-                const sig_time = hours !== null ? scoreTiming(hours) : 0;
                 return {
-                    ...t, mkt: m,
-                    sig_odds, sig_time, sig_wr: null, sig_dorm: null,
-                    hours, quickScore: sig_odds + sig_time, quickMax: 40,
+                    ...t, sig_odds, sig_time: null, sig_wr: null, sig_dorm: null,
+                    hours: null, endDate: null, quickScore: sig_odds, quickMax: 18,
                     fullScore: null, fullMax: null,
+                    w_wins: null, w_resolved: null, w_pnl: null, w_open: null,
                     enriched: false, enriching: false,
                 };
-            }).filter(t => t.quickScore >= minScoreR.current);
+            }).filter(t => t.sig_odds >= minScoreR.current || minScoreR.current <= 5);
             const seen = new Map();
             scored.forEach(t => {
                 const key = `${t.addr}|${t.conditionId}`;
-                if (!seen.has(key) || t.quickScore > seen.get(key).quickScore)
+                if (!seen.has(key) || t.sig_odds > seen.get(key).sig_odds)
                     seen.set(key, t);
             });
-            const deduped = [...seen.values()].sort((a, b) => b.quickScore - a.quickScore);
+            const deduped = [...seen.values()]
+                .sort((a, b) => b.cash - a.cash)
+                .sort((a, b) => b.sig_odds - a.sig_odds);
             const fresh = new Set(deduped.filter(t => !prevIds.current.has(t.id)).map(t => t.id));
             prevIds.current = new Set(deduped.map(t => t.id));
             setNewIds(fresh);
             setFeed(deduped);
             setLastUpd(new Date());
+            setPhase("enrich");
+            deduped.slice(0, 4).forEach(t => enrich(t));
             setPhase("done");
-            // Auto-enrich the top 3 (each adds several proxied calls; users can
-            // expand any other row to enrich it on demand).
-            deduped.slice(0, 3).forEach(t => enrich(t));
         }
         catch (e) {
             if (isNetworkBlock(e)) {
-                setErrMsg("Couldn't reach Polymarket — tried a direct call plus two public CORS proxies and all were blocked. This is an environment/network limit, not a code bug: the sandbox or your network is blocking outbound requests, or the public proxies are rate-limited or down right now. Options: (1) hit ↻ SCAN NOW again in a minute — proxy availability fluctuates; (2) run this from your own page behind a Vite dev-server proxy or a tiny Node/serverless fetch relay, which is the bulletproof path. The scoring logic itself is verified against Polymarket's documented API schema.");
+                setErrMsg("Couldn't reach data-api.polymarket.com. If you just opened the page, tap ↻ SCAN NOW once more. If it persists, your network or a browser extension may be blocking the request.");
             }
             else {
                 setErrMsg(e.message || "Scan failed.");
@@ -549,11 +422,11 @@ function App() {
         if (sortBy === "score")
             return bs - as;
         if (sortBy === "size")
-            return b.size - a.size;
+            return b.cash - a.cash;
         if (sortBy === "odds")
             return a.price - b.price;
         if (sortBy === "time")
-            return ((_c = a.hours) !== null && _c !== void 0 ? _c : 9999) - ((_d = b.hours) !== null && _d !== void 0 ? _d : 9999);
+            return ((_c = a.hours) !== null && _c !== void 0 ? _c : 9e9) - ((_d = b.hours) !== null && _d !== void 0 ? _d : 9e9);
         return bs - as;
     });
     const toggle = id => {
@@ -572,14 +445,12 @@ function App() {
     };
     const critCount = feed.filter(t => { var _a; return ((_a = t.fullScore) !== null && _a !== void 0 ? _a : t.quickScore) >= 60; }).length;
     const highCount = feed.filter(t => { var _a; return ((_a = t.fullScore) !== null && _a !== void 0 ? _a : t.quickScore) >= 40; }).length;
-    return (React.createElement("div", { style: { background: T.bg, minHeight: "100vh", color: T.text,
-            fontFamily: "'Inter', system-ui, sans-serif", fontSize: 13 } },
+    return (React.createElement("div", { style: { background: T.bg, minHeight: "100vh", color: T.text, fontFamily: "'Inter', system-ui, sans-serif", fontSize: 13 } },
         React.createElement("style", null, `
         @keyframes ping  { 0%,100%{opacity:.2;transform:scale(1)} 60%{opacity:.5;transform:scale(2.4)} }
         @keyframes spin  { to{transform:rotate(360deg)} }
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
         * { box-sizing: border-box; }
-        input::placeholder { color: #1E3040; }
         ::-webkit-scrollbar { width: 5px; height: 5px; }
         ::-webkit-scrollbar-track { background: #07080F; }
         ::-webkit-scrollbar-thumb { background: #283848; border-radius: 3px; }
@@ -588,152 +459,94 @@ function App() {
         button { transition: opacity .12s, border-color .12s; }
       `),
         React.createElement("div", { style: { borderBottom: `1px solid ${T.bdr}`, padding: "11px 18px" } },
-            React.createElement("div", { style: { maxWidth: 1240, margin: "0 auto",
-                    display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 } },
+            React.createElement("div", { style: { maxWidth: 1240, margin: "0 auto", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 } },
                 React.createElement("div", null,
                     React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 2 } },
                         React.createElement("span", { style: { fontFamily: T.mono, fontSize: 14, fontWeight: 700, letterSpacing: 2.5 } }, "POLYMARKET INSIDER SCREENER"),
-                        React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 6,
-                                background: "rgba(74,222,128,.07)", border: "1px solid rgba(74,222,128,.18)",
-                                padding: "2px 8px 2px 6px", borderRadius: 3 } },
-                            React.createElement("div", { style: { width: 5, height: 5, borderRadius: "50%", background: T.ok,
-                                    animation: "pulse 1.6s ease-in-out infinite" } }),
-                            React.createElement("span", { style: { fontSize: 8, fontWeight: 700, color: T.ok, letterSpacing: 2 } }, "LIVE FEED")),
-                        critCount > 0 && (React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 5,
-                                background: "rgba(255,59,59,.08)", border: "1px solid rgba(255,59,59,.22)",
-                                padding: "2px 8px", borderRadius: 3 } },
+                        React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 6, background: "rgba(74,222,128,.07)", border: "1px solid rgba(74,222,128,.18)", padding: "2px 8px 2px 6px", borderRadius: 3 } },
+                            React.createElement("div", { style: { width: 5, height: 5, borderRadius: "50%", background: T.ok, animation: "pulse 1.6s ease-in-out infinite" } }),
+                            React.createElement("span", { style: { fontSize: 8, fontWeight: 700, color: T.ok, letterSpacing: 2 } }, "LIVE")),
+                        critCount > 0 && (React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 5, background: "rgba(255,59,59,.08)", border: "1px solid rgba(255,59,59,.22)", padding: "2px 8px", borderRadius: 3 } },
                             React.createElement(Dot, { color: "#FF3B3B", size: 6 }),
                             React.createElement("span", { style: { fontSize: 8, color: "#FF7A7A", fontFamily: T.mono } },
                                 critCount,
-                                " HIGH/CRITICAL")))),
-                    React.createElement("div", { style: { fontSize: 10, color: T.dim } }, "data-api.polymarket.com via CORS-proxy fallback \u00B7 server-filtered by $ size + side \u00B7 5 auto-signals \u00B7 refresh 60s")),
+                                " HIGH/CRIT")))),
+                    React.createElement("div", { style: { fontSize: 10, color: T.dim } }, "data-api \u00B7 /trades feed + /positions enrichment \u00B7 cash = price\u00D7size \u00B7 timing & win-rate from positions")),
                 React.createElement("div", { style: { display: "flex", gap: 8, alignItems: "center" } },
-                    React.createElement("button", { onClick: () => setShowCtrl(p => !p), style: {
-                            background: "transparent", border: `1px solid ${showCtrl ? "rgba(56,189,248,.3)" : T.bdr}`,
-                            color: showCtrl ? T.a : T.muted, padding: "7px 12px",
-                            borderRadius: 5, cursor: "pointer", fontSize: 11,
-                        } }, "\u2699 Filters"),
-                    React.createElement("button", { onClick: scan, disabled: scanning, style: {
-                            background: scanning ? "transparent" : "rgba(56,189,248,.10)",
-                            border: "1px solid rgba(56,189,248,.28)", color: T.a,
-                            padding: "7px 16px", borderRadius: 5, cursor: scanning ? "default" : "pointer",
-                            fontSize: 11, fontWeight: 700, letterSpacing: .5, opacity: scanning ? .4 : 1,
-                        } }, scanning ? "SCANNING…" : "↻ SCAN NOW")))),
+                    React.createElement("button", { onClick: () => setShowCtrl(p => !p), style: { background: "transparent", border: `1px solid ${showCtrl ? "rgba(56,189,248,.3)" : T.bdr}`, color: showCtrl ? T.a : T.muted, padding: "7px 12px", borderRadius: 5, cursor: "pointer", fontSize: 11 } }, "\u2699 Filters"),
+                    React.createElement("button", { onClick: scan, disabled: scanning, style: { background: scanning ? "transparent" : "rgba(56,189,248,.10)", border: "1px solid rgba(56,189,248,.28)", color: T.a, padding: "7px 16px", borderRadius: 5, cursor: scanning ? "default" : "pointer", fontSize: 11, fontWeight: 700, letterSpacing: .5, opacity: scanning ? .4 : 1 } }, scanning ? "SCANNING…" : "↻ SCAN NOW")))),
         showCtrl && (React.createElement("div", { style: { borderBottom: `1px solid ${T.bdr}`, padding: "12px 18px", background: "rgba(12,17,32,.9)" } },
             React.createElement("div", { style: { maxWidth: 1240, margin: "0 auto", display: "flex", gap: 24, flexWrap: "wrap", alignItems: "flex-end" } },
                 React.createElement("div", null,
-                    React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "MIN TRADE SIZE ($)"),
-                    React.createElement("div", { style: { display: "flex", gap: 5 } }, [[500, "$500"], [1000, "$1K"], [5000, "$5K"], [10000, "$10K"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMinSize(v), style: {
-                            padding: "5px 10px", fontSize: 10, fontFamily: T.mono,
-                            background: minSize === v ? "rgba(56,189,248,.14)" : "transparent",
-                            border: `1px solid ${minSize === v ? "rgba(56,189,248,.35)" : T.bdr}`,
-                            color: minSize === v ? T.a : T.muted, borderRadius: 4, cursor: "pointer",
-                        } }, l))))),
+                    React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "MIN CASH VALUE (price \u00D7 shares)"),
+                    React.createElement("div", { style: { display: "flex", gap: 5 } }, [[100, "$100"], [500, "$500"], [1000, "$1K"], [5000, "$5K"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMinCash(v), style: { padding: "5px 10px", fontSize: 10, fontFamily: T.mono, background: minCash === v ? "rgba(56,189,248,.14)" : "transparent", border: `1px solid ${minCash === v ? "rgba(56,189,248,.35)" : T.bdr}`, color: minCash === v ? T.a : T.muted, borderRadius: 4, cursor: "pointer" } }, l))))),
                 React.createElement("div", null,
-                    React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "MIN SCORE (of 40 auto-pts)"),
-                    React.createElement("div", { style: { display: "flex", gap: 5 } }, [[5, "5+"], [8, "8+"], [12, "12+"], [18, "18+"], [22, "22+"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMinScore(v), style: {
-                            padding: "5px 10px", fontSize: 10, fontFamily: T.mono,
-                            background: minScore === v ? "rgba(249,115,22,.14)" : "transparent",
-                            border: `1px solid ${minScore === v ? "rgba(249,115,22,.35)" : T.bdr}`,
-                            color: minScore === v ? T.s : T.muted, borderRadius: 4, cursor: "pointer",
-                        } }, l))))),
+                    React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "MIN ENTRY-ODDS SCORE (pre-enrich)"),
+                    React.createElement("div", { style: { display: "flex", gap: 5 } }, [[0, "all"], [5, "5+"], [10, "10+"], [14, "14+"], [18, "18"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMinScore(v), style: { padding: "5px 10px", fontSize: 10, fontFamily: T.mono, background: minScore === v ? "rgba(249,115,22,.14)" : "transparent", border: `1px solid ${minScore === v ? "rgba(249,115,22,.35)" : T.bdr}`, color: minScore === v ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, l))))),
                 React.createElement("div", null,
                     React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "AUTO-REFRESH"),
-                    React.createElement("button", { onClick: () => setAutoRef(p => !p), style: {
-                            padding: "5px 12px", fontSize: 10,
-                            background: autoRef ? "rgba(74,222,128,.10)" : "transparent",
-                            border: `1px solid ${autoRef ? "rgba(74,222,128,.28)" : T.bdr}`,
-                            color: autoRef ? T.ok : T.muted, borderRadius: 4, cursor: "pointer",
-                        } }, autoRef ? "ON · every 60s" : "OFF")),
-                React.createElement("div", { style: { fontSize: 10, color: T.dim, lineHeight: 1.7, marginLeft: "auto", maxWidth: 280 } },
-                    "Size & side filtered server-side via Polymarket's ",
-                    React.createElement("code", { style: { color: T.muted } }, "filterType=CASH"),
-                    " param \u2014 fetches only matching trades, not a haystack to discard client-side.")))),
+                    React.createElement("button", { onClick: () => setAutoRef(p => !p), style: { padding: "5px 12px", fontSize: 10, background: autoRef ? "rgba(74,222,128,.10)" : "transparent", border: `1px solid ${autoRef ? "rgba(74,222,128,.28)" : T.bdr}`, color: autoRef ? T.ok : T.muted, borderRadius: 4, cursor: "pointer" } }, autoRef ? "ON · 60s" : "OFF")),
+                React.createElement("div", { style: { fontSize: 10, color: T.dim, lineHeight: 1.7, marginLeft: "auto", maxWidth: 290 } }, "Pre-enrich score is Entry Odds only (0\u201318). Timing (+22), Win Rate (+6), Dormancy (+7) fill in as each wallet's positions load. Privacy Bridge & Wallet Age remain manual via row links.")))),
         React.createElement("div", { style: { borderBottom: `1px solid ${T.bdr}`, padding: "7px 18px" } },
             React.createElement("div", { style: { maxWidth: 1240, margin: "0 auto", display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap" } },
                 [
-                    ["Trades fetched", fetched || (scanning ? "…" : "0")],
+                    ["Trades pulled", fetched || (scanning ? "…" : "0")],
                     ["Flagged", feed.length || (scanning ? "…" : "0")],
                     ["HIGH+", highCount],
-                    ["Wallet-enriched", feed.filter(t => t.enriched).length],
-                    ["Min size", `$${minSize.toLocaleString()}`],
-                    ["Min score", `${minScore}+`],
+                    ["Enriched", feed.filter(t => t.enriched).length],
+                    ["Min cash", `$${minCash.toLocaleString()}`],
                     ["Last scan", lastUpd ? lastUpd.toLocaleTimeString() : "—"],
-                    ["Route", lastUpd ? (PROXY_USED || "—") : "—"],
                 ].map(([k, v]) => (React.createElement("div", { key: k, style: { display: "flex", gap: 5, alignItems: "center" } },
                     React.createElement("span", { style: { fontSize: 9, color: T.dim } },
                         k,
                         ":"),
                     React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, color: T.text } }, v)))),
                 scanning && (React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", marginLeft: 4 } },
-                    React.createElement("div", { style: { width: 7, height: 7, border: `1.5px solid ${T.bdr}`,
-                            borderTop: `1.5px solid ${T.a}`, borderRadius: "50%", animation: "spin .7s linear infinite" } }),
-                    React.createElement("span", { style: { fontSize: 9, color: T.a, letterSpacing: 1 } }, "scanning"))),
+                    React.createElement("div", { style: { width: 7, height: 7, border: `1.5px solid ${T.bdr}`, borderTop: `1.5px solid ${T.a}`, borderRadius: "50%", animation: "spin .7s linear infinite" } }),
+                    React.createElement("span", { style: { fontSize: 9, color: T.a, letterSpacing: 1 } }, phase))),
                 React.createElement("div", { style: { marginLeft: "auto", display: "flex", gap: 5, alignItems: "center" } },
                     React.createElement("span", { style: { fontSize: 9, color: T.dim } }, "Sort:"),
-                    [["score", "Score"], ["size", "Size"], ["odds", "Odds %"], ["time", "Pre-Res"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setSortBy(v), style: {
-                            padding: "2px 8px", fontSize: 9,
-                            background: sortBy === v ? "rgba(56,189,248,.10)" : "transparent",
-                            border: `1px solid ${sortBy === v ? "rgba(56,189,248,.25)" : T.bdr}`,
-                            color: sortBy === v ? T.a : T.dim, borderRadius: 3, cursor: "pointer",
-                        } }, l)))))),
+                    [["score", "Score"], ["size", "Cash"], ["odds", "Odds %"], ["time", "Timing"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setSortBy(v), style: { padding: "2px 8px", fontSize: 9, background: sortBy === v ? "rgba(56,189,248,.10)" : "transparent", border: `1px solid ${sortBy === v ? "rgba(56,189,248,.25)" : T.bdr}`, color: sortBy === v ? T.a : T.dim, borderRadius: 3, cursor: "pointer" } }, l)))))),
         React.createElement("div", { style: { maxWidth: 1240, margin: "0 auto", padding: "0 0 36px" } },
-            errMsg && (React.createElement("div", { style: { margin: "16px 18px", padding: "12px 14px",
-                    background: "rgba(255,59,59,.06)", border: "1px solid rgba(255,59,59,.2)", borderRadius: 6 } },
+            errMsg && (React.createElement("div", { style: { margin: "16px 18px", padding: "12px 14px", background: "rgba(255,59,59,.06)", border: "1px solid rgba(255,59,59,.2)", borderRadius: 6 } },
                 React.createElement("span", { style: { fontSize: 11, color: "#FF7A7A", lineHeight: 1.7 } },
                     "\u26A0 ",
                     errMsg))),
             scanning && feed.length === 0 && (React.createElement("div", { style: { textAlign: "center", padding: "60px 16px" } },
-                React.createElement("div", { style: { width: 44, height: 44, margin: "0 auto 18px",
-                        border: `3px solid ${T.bdr}`, borderTop: `3px solid ${T.a}`,
-                        borderRadius: "50%", animation: "spin .8s linear infinite" } }),
+                React.createElement("div", { style: { width: 44, height: 44, margin: "0 auto 18px", border: `3px solid ${T.bdr}`, borderTop: `3px solid ${T.a}`, borderRadius: "50%", animation: "spin .8s linear infinite" } }),
                 React.createElement("div", { style: { fontSize: 12, color: T.a, fontFamily: T.mono, letterSpacing: 2, marginBottom: 14 } }, "SCANNING POLYMARKET"),
-                React.createElement(Steps, { current: phase }))),
+                React.createElement(Steps, { phase: phase }))),
             !scanning && feed.length === 0 && phase === "done" && (React.createElement("div", { style: { textAlign: "center", padding: "60px 16px" } },
                 React.createElement("div", { style: { fontSize: 28, marginBottom: 12 } }, "\u2713"),
                 React.createElement("div", { style: { fontSize: 13, color: T.ok, marginBottom: 8 } }, "No flagged trades this scan"),
                 React.createElement("div", { style: { fontSize: 11, color: T.dim, lineHeight: 1.8 } },
                     fetched,
-                    " trades \u2265$",
-                    minSize.toLocaleString(),
-                    " fetched \u00B7 none scored \u2265",
+                    " trades pulled \u00B7 none \u2265 $",
+                    minCash.toLocaleString(),
+                    " cash with odds score \u2265 ",
                     minScore,
                     ".",
                     React.createElement("br", null),
-                    "Try lowering filters, or wait for the next auto-refresh."))),
+                    "Lower the filters or wait for the next refresh."))),
             sorted.length > 0 && (React.createElement("div", { style: { overflowX: "auto" } },
                 React.createElement("table", { style: { width: "100%", borderCollapse: "collapse", tableLayout: "fixed", minWidth: 820 } },
                     React.createElement("colgroup", null,
                         React.createElement("col", { style: { width: 32 } }),
                         React.createElement("col", { style: { width: 84 } }),
-                        React.createElement("col", { style: { width: 76 } }),
+                        React.createElement("col", { style: { width: 84 } }),
                         React.createElement("col", { style: { width: 114 } }),
                         React.createElement("col", null),
                         React.createElement("col", { style: { width: 76 } }),
-                        React.createElement("col", { style: { width: 94 } }),
-                        React.createElement("col", { style: { width: 76 } }),
+                        React.createElement("col", { style: { width: 90 } }),
+                        React.createElement("col", { style: { width: 70 } }),
                         React.createElement("col", { style: { width: 60 } })),
                     React.createElement("thead", null,
-                        React.createElement("tr", { style: { borderBottom: `1px solid ${T.bdr}` } }, ["", "RISK", "SCORE", "WALLET", "MARKET", "ENTRY %", "SIZE", "PRE-RES", "SIDE"].map((h, i) => (React.createElement("th", { key: i, style: {
-                                padding: `8px 8px 8px ${i === 0 ? "16px" : "8px"}`,
-                                fontSize: 8, color: T.dim, letterSpacing: 1.8, fontWeight: 700,
-                                textAlign: "left", whiteSpace: "nowrap",
-                            } }, h))))),
+                        React.createElement("tr", { style: { borderBottom: `1px solid ${T.bdr}` } }, ["", "RISK", "SCORE", "WALLET", "MARKET", "ENTRY %", "CASH", "TIMING", "SIDE"].map((h, i) => (React.createElement("th", { key: i, style: { padding: `8px 8px 8px ${i === 0 ? "16px" : "8px"}`, fontSize: 8, color: T.dim, letterSpacing: 1.8, fontWeight: 700, textAlign: "left", whiteSpace: "nowrap" } }, h))))),
                     React.createElement("tbody", null, sorted.map(item => (React.createElement(FeedRow, { key: item.id, item: item, isNew: newIds.has(item.id), expanded: expanded.has(item.id), onToggle: () => toggle(item.id) }))))),
                 React.createElement("div", { style: { padding: "12px 18px", borderTop: `1px solid ${T.bdr}` } },
                     React.createElement("span", { style: { fontSize: 9, color: T.dim, lineHeight: 1.8 } },
                         sorted.length,
-                        " flagged \u00B7 sorted by ",
-                        sortBy,
-                        " \u00B7",
-                        " ",
-                        "Quick score (auto) = Entry Odds (S\u00B718) + Pre-Resolution Timing (S\u00B722) \u00B7",
-                        " ",
-                        "Full score adds Win Rate (A\u00B76) + Dormancy (A\u00B77) after wallet enrichment \u00B7",
-                        " ",
-                        "Privacy Bridge (S\u00B725) + Wallet Age (A\u00B710) + Multi-Wallet (A\u00B712) require manual checks via expanded rows \u00B7",
-                        " ",
-                        "Click any row to expand")))))));
+                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201318) \u00B7 Timing/Win-Rate/Dormancy fill in from each wallet's /positions \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
 
