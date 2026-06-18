@@ -4,8 +4,6 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Polymarket Insider Screener</title>
-
-  <!-- PWA -->
   <link rel="manifest" href="/manifest.webmanifest" />
   <meta name="theme-color" content="#07080F" />
   <link rel="icon" type="image/png" href="/icon-192.png" />
@@ -13,10 +11,9 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="apple-mobile-web-app-title" content="Insider Screener" />
-
   <style>
     html, body, #root { margin: 0; height: 100%; background: #07080F; }
-    #boot { color:#56687A; font-family: system-ui, sans-serif; font-size:13px; display:flex; align-items:center; justify-content:center; height:100vh; }
+    #boot { color:#AEC0D2; font-family: system-ui, sans-serif; font-size:13px; display:flex; align-items:center; justify-content:center; height:100vh; }
   </style>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -41,9 +38,9 @@ const { useState, useEffect, useCallback, useRef } = React;
 // ════════════════════════════════════════════════════════════════════════════
 const DA = "https://data-api.polymarket.com";
 const T = {
-    bg: "#07080F", panel: "#0C1120", bdr: "#162032", text: "#E2EAF8",
-    muted: "#56687A", dim: "#283848", mono: "'Courier New', monospace",
-    s: "#F97316", a: "#38BDF8", ok: "#4ADE80",
+    bg: "#07080F", panel: "#0C1120", bdr: "#162032", text: "#EAF2FB",
+    muted: "#AEC0D2", dim: "#7F94A8", mono: "'Courier New', monospace",
+    s: "#FB8C3C", a: "#5BC4F5", ok: "#5FE08D",
 };
 const RISK = [
     { min: 80, label: "CRITICAL", c: "#FF3B3B", bg: "rgba(255,59,59,.09)", bd: "rgba(255,59,59,.28)" },
@@ -187,7 +184,7 @@ function MiniBar({ label, tier, pts, max, naText }) {
         React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 } },
             React.createElement("div", { style: { display: "flex", gap: 5, alignItems: "center" } },
                 React.createElement("span", { style: { fontSize: 7, color: tc, background: `${tc}18`, fontFamily: T.mono, padding: "1px 3px", borderRadius: 2 } }, tier),
-                React.createElement("span", { style: { fontSize: 11, color: pts > 0 ? "#C8DCE8" : T.muted } }, label)),
+                React.createElement("span", { style: { fontSize: 11, color: pts > 0 ? "#D6E6F2" : T.muted } }, label)),
             React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, fontWeight: 600, color: pts > 0 ? tc : T.dim } },
                 pts,
                 "/",
@@ -227,7 +224,7 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                 item.enriched && React.createElement("span", { style: { marginLeft: 4, fontSize: 8, color: T.ok }, title: "Wallet enriched" }, "\u2713"),
                 item.enriching && React.createElement("span", { style: { marginLeft: 4, fontSize: 9, color: T.a, display: "inline-block", animation: "spin .8s linear infinite" } }, "\u21BB")),
             React.createElement("td", { style: { padding: "10px 8px" } },
-                React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, color: "#4A9ABB" } }, item.addr ? `${item.addr.slice(0, 6)}…${item.addr.slice(-4)}` : "—")),
+                React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, color: "#7FBEDB" } }, item.addr ? `${item.addr.slice(0, 6)}…${item.addr.slice(-4)}` : "—")),
             React.createElement("td", { style: { padding: "10px 8px" } },
                 React.createElement("div", { style: { fontSize: 11, color: T.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 260 } }, item.title || `${item.conditionId.slice(0, 28)}…`)),
             React.createElement("td", { style: { padding: "10px 8px" } },
@@ -391,9 +388,21 @@ function App() {
         setErrMsg("");
         setPhase("trades");
         try {
-            const raw = await jFetch(`${DA}/trades?limit=500&takerOnly=true`);
-            if (!Array.isArray(raw))
-                throw new Error("Unexpected response from data-api.");
+            // The data-api caps /trades at 500 per request, so to pull 1,000 we fetch
+            // two pages via offset (0 and 500) and combine them. If a page comes back
+            // short, there's no more data and we stop early.
+            const PAGE = 500, TARGET = 1000;
+            let raw = [];
+            for (let offset = 0; offset < TARGET; offset += PAGE) {
+                const page = await jFetch(`${DA}/trades?limit=${PAGE}&offset=${offset}&takerOnly=true`);
+                if (!Array.isArray(page) || page.length === 0)
+                    break;
+                raw = raw.concat(page);
+                if (page.length < PAGE)
+                    break; // reached the end of available trades
+            }
+            if (!raw.length)
+                throw new Error("No trades returned from data-api.");
             setPhase("scoring");
             const buys = raw.map(parseTrade).filter(t => t.side === "BUY" && t.addr && t.conditionId && t.cash >= minCashR.current);
             // Allowlist: keep only politics/geopolitics/legal/macro markets (by title).
@@ -503,7 +512,7 @@ function App() {
                             React.createElement("span", { style: { fontSize: 8, color: "#FF7A7A", fontFamily: T.mono } },
                                 critCount,
                                 " HIGH/CRIT")))),
-                    React.createElement("div", { style: { fontSize: 10, color: T.dim } }, "data-api \u00B7 politics/geo allowlist (sports, crypto, meme markets hidden) \u00B7 cash = price\u00D7size \u00B7 timing from positions")),
+                    React.createElement("div", { style: { fontSize: 11, color: T.dim } }, "data-api \u00B7 politics/geo allowlist (sports, crypto, meme markets hidden) \u00B7 cash = price\u00D7size \u00B7 timing from positions")),
                 React.createElement("div", { style: { display: "flex", gap: 8, alignItems: "center" } },
                     React.createElement("button", { onClick: () => setShowCtrl(p => !p), style: { background: "transparent", border: `1px solid ${showCtrl ? "rgba(56,189,248,.3)" : T.bdr}`, color: showCtrl ? T.a : T.muted, padding: "7px 12px", borderRadius: 5, cursor: "pointer", fontSize: 11 } }, "\u2699 Filters"),
                     React.createElement("button", { onClick: scan, disabled: scanning, style: { background: scanning ? "transparent" : "rgba(56,189,248,.10)", border: "1px solid rgba(56,189,248,.28)", color: T.a, padding: "7px 16px", borderRadius: 5, cursor: scanning ? "default" : "pointer", fontSize: 11, fontWeight: 700, letterSpacing: .5, opacity: scanning ? .4 : 1 } }, scanning ? "SCANNING…" : "↻ SCAN NOW")))),
@@ -580,7 +589,7 @@ function App() {
                         React.createElement("tr", { style: { borderBottom: `1px solid ${T.bdr}` } }, ["", "RISK", "SCORE", "WALLET", "MARKET", "ENTRY %", "CASH", "TIMING", "SIDE"].map((h, i) => (React.createElement("th", { key: i, style: { padding: `8px 8px 8px ${i === 0 ? "16px" : "8px"}`, fontSize: 8, color: T.dim, letterSpacing: 1.8, fontWeight: 700, textAlign: "left", whiteSpace: "nowrap" } }, h))))),
                     React.createElement("tbody", null, sorted.map(item => (React.createElement(FeedRow, { key: item.id, item: item, isNew: newIds.has(item.id), expanded: expanded.has(item.id), onToggle: () => toggle(item.id) }))))),
                 React.createElement("div", { style: { padding: "12px 18px", borderTop: `1px solid ${T.bdr}` } },
-                    React.createElement("span", { style: { fontSize: 9, color: T.dim, lineHeight: 1.8 } },
+                    React.createElement("span", { style: { fontSize: 10, color: T.dim, lineHeight: 1.85 } },
                         sorted.length,
                         " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201318) \u00B7 Timing/Win-Rate/Dormancy fill in from each wallet's /positions \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
 }
@@ -589,9 +598,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(
   </script>
   <script>
     if ("serviceWorker" in navigator) {
-      window.addEventListener("load", function () {
-        navigator.serviceWorker.register("/sw.js").catch(function () {});
-      });
+      window.addEventListener("load", function () { navigator.serviceWorker.register("/sw.js").catch(function () {}); });
     }
   </script>
 </body>
