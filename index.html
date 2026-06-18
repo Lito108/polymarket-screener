@@ -1,0 +1,878 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Polymarket Insider Screener</title>
+  <style>
+    html, body, #root { margin: 0; height: 100%; background: #07080F; }
+    #boot { color:#56687A; font-family: system-ui, sans-serif; font-size:13px;
+            display:flex; align-items:center; justify-content:center; height:100vh; }
+  </style>
+  <!-- React (production UMD builds) -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Babel compiles the JSX below in the browser, so there is no build step -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"><div id="boot">Loading screener…</div></div>
+
+  <script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useRef } = React;
+// ════════════════════════════════════════════════════════════════════════════
+// POLYMARKET API REFERENCE (verified against docs.polymarket.com, June 2026)
+// ────────────────────────────────────────────────────────────────────────────
+//  data-api.polymarket.com  → trades, positions, activity, holders (NO AUTH)
+//  gamma-api.polymarket.com → markets, events, tags, search        (NO AUTH)
+//  clob.polymarket.com      → orderbook, prices, order management  (auth for trading)
+//
+//  GET /trades params: limit, offset, takerOnly, filterType(CASH|TOKENS),
+//                       filterAmount, market, eventId, user, side(BUY|SELL)
+//  Trade fields: proxyWallet, side, asset, conditionId, size(=SHARES, not $),
+//                price, timestamp, title, slug, eventSlug, outcome, outcomeIndex
+//
+//  GET /markets params include condition_ids (CSV), closed(bool, default false)
+//  Market fields: conditionId, endDate/endDateIso, closed,
+//                 outcomes & outcomePrices are JSON-ENCODED STRINGS, not arrays
+// ════════════════════════════════════════════════════════════════════════════
+
+const DA = "https://data-api.polymarket.com";
+const GM = "https://gamma-api.polymarket.com";
+
+// ── Design tokens ──────────────────────────────────────────────────────────────
+const T = {
+  bg: "#07080F", panel: "#0C1120", bdr: "#162032", text: "#E2EAF8",
+  muted: "#56687A", dim: "#283848", mono: "'Courier New', monospace",
+  s: "#F97316", a: "#38BDF8", ok: "#4ADE80",
+};
+
+// ── Risk tiers ─────────────────────────────────────────────────────────────────
+const RISK = [
+  { min: 80, label: "CRITICAL", c: "#FF3B3B", bg: "rgba(255,59,59,.09)",  bd: "rgba(255,59,59,.28)"  },
+  { min: 60, label: "HIGH",     c: "#FF7A2F", bg: "rgba(255,122,47,.09)", bd: "rgba(255,122,47,.28)" },
+  { min: 40, label: "MEDIUM",   c: "#F5C518", bg: "rgba(245,197,24,.09)", bd: "rgba(245,197,24,.28)" },
+  { min: 20, label: "LOW",      c: "#60A5FA", bg: "rgba(96,165,250,.09)", bd: "rgba(96,165,250,.28)" },
+  { min: 0,  label: "MINIMAL",  c: "#34D399", bg: "rgba(52,211,153,.09)", bd: "rgba(52,211,153,.28)" },
+];
+const getR = s => RISK.find(r => s >= r.min) || RISK[4];
+
+// ── Scoring ────────────────────────────────────────────────────────────────────
+const scoreOdds = p => {
+  if (!p || p <= 0) return 0;
+  if (p < 10) return 18;
+  if (p < 20) return 14;
+  if (p < 35) return 10;
+  if (p < 50) return 5;
+  return 0;
+};
+const scoreTiming = h => {
+  if (h === null || h === undefined || h < 0) return 0;
+  if (h < 6)   return 22;
+  if (h < 24)  return 18;
+  if (h < 72)  return 12;
+  if (h < 168) return 6;
+  return 0;
+};
+const scoreWR = (w, t) => {
+  if (t < 3) return 0;
+  const r = w / t;
+  if (r >= 1.0)  return 6;
+  if (r >= 0.8)  return 4;
+  if (r >= 0.65) return 2;
+  return 0;
+};
+const scoreDorm = after => {
+  if (after === null || after === undefined) return null;
+  if (after === 0) return 7;
+  if (after < 2)  return 4;
+  return 0;
+};
+
+// ── Fetch helpers ──────────────────────────────────────────────────────────────
+// Polymarket's data/gamma APIs send CORS headers scoped to their own frontend,
+// so a direct browser call from any other origin (this sandbox, localhost, a
+// deployed site on a different domain) is blocked by the browser BEFORE it ever
+// reaches Polymarket. The standard fix is a CORS proxy: a server that makes the
+// request for us and re-serves it with Access-Control-Allow-Origin: *.
+// We try direct first (works if you later run behind your own server/Vite proxy),
+// then fall through public CORS proxies. First strategy to succeed wins.
+const PROXIES = [
+  null,                                                                 // direct (same-origin if behind your own relay/Vite proxy)
+  u => `/api/poly?url=${encodeURIComponent(u)}`,                        // your Netlify/CF relay (preferred; inert until deployed)
+  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,   // public proxy 1 (fallback)
+  u => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,            // public proxy 2 (fallback)
+];
+
+const PROXY_LABELS = ["direct", "relay", "allorigins", "corsproxy"];
+let PROXY_USED = null; // remembers which strategy worked, for the status line
+
+const jFetch = async url => {
+  let lastErr;
+  for (let i = 0; i < PROXIES.length; i++) {
+    const target = PROXIES[i] ? PROXIES[i](url) : url;
+    try {
+      const r = await fetch(target, { headers: { Accept: "application/json" } });
+      if (!r.ok) { lastErr = new Error(`HTTP ${r.status}`); continue; }
+      const data = await r.json();
+      PROXY_USED = PROXY_LABELS[i] || `route ${i}`;
+      return data;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error("All fetch strategies (direct + proxies) failed");
+};
+
+const isNetworkBlock = e => {
+  const m = String(e?.message || e);
+  return m.includes("Failed to fetch") || m.includes("NetworkError") ||
+         m.includes("Load failed") || m.includes("fetch failed");
+};
+
+// Unix seconds vs milliseconds heuristic (ms epoch now ≈ 1.78e12, seconds ≈ 1.78e9)
+const normalizeTs = t => {
+  const n = Number(t);
+  if (!n) return null;
+  return new Date(n > 1e12 ? n : n * 1000);
+};
+
+const safeJsonArr = s => {
+  if (Array.isArray(s)) return s;
+  if (typeof s !== "string") return null;
+  try { const p = JSON.parse(s); return Array.isArray(p) ? p : null; } catch { return null; }
+};
+
+const chunk = (arr, n) => {
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+};
+
+// ── Parsers (matches verified API schema) ──────────────────────────────────────
+// NOTE: trade "size" is SHARE COUNT, not dollars. Dollar notional = price × size.
+// We store that notional in `.size` below so the rest of the UI can treat it as $.
+const parseTrade = r => {
+  const price  = parseFloat(r.price || 0);
+  const shares = parseFloat(r.size || 0);
+  return {
+    id:          r.transactionHash || `${r.proxyWallet || "?"}-${r.conditionId || "?"}-${r.timestamp || Math.random()}`,
+    addr:        r.proxyWallet || "",
+    conditionId: r.conditionId || "",
+    ts:          normalizeTs(r.timestamp),
+    price,
+    shares,
+    size:        price * shares,              // dollar notional, used as "$ size" everywhere below
+    side:        (r.side || "BUY").toUpperCase(),
+    outcome:     r.outcome || "",
+    title:       r.title || "",
+    slug:        r.slug || "",
+  };
+};
+
+const parseMkt = r => ({
+  question:      r.question || "",
+  endDate:       r.endDate ? new Date(r.endDate) : (r.endDateIso ? new Date(r.endDateIso) : null),
+  closed:        !!r.closed,
+  outcomes:      safeJsonArr(r.outcomes) || ["Yes", "No"],
+  outcomePrices: (safeJsonArr(r.outcomePrices) || ["0.5", "0.5"]).map(parseFloat),
+  slug:          r.slug || "",
+});
+
+const didWin = (t, m) => {
+  if (!m?.closed) return null;
+  const i = m.outcomes.findIndex(o => o.toLowerCase() === (t.outcome || "").toLowerCase());
+  return i === -1 ? null : m.outcomePrices[i] > 0.5;
+};
+
+const preSusp = t => scoreOdds(t.price * 100) + (t.size > 5000 ? 3 : t.size > 1000 ? 1 : 0);
+
+// Fetch market metadata for a batch of conditionIds. Gamma's `closed` filter
+// defaults to false, which would silently drop resolved markets — so we query
+// both closed states explicitly and merge, guaranteeing full coverage.
+// Chunked at 50 (gamma's condition_ids ceiling is ~100) and the caller caps the
+// id count, so total proxied market calls stay small even on a big scan.
+const fetchMarketsByConditionIds = async ids => {
+  const unique = [...new Set(ids)].filter(Boolean);
+  if (!unique.length) return {};
+  const batches = chunk(unique, 50);
+  const map = {};
+  const calls = batches.flatMap(b => {
+    const csv = b.join(",");
+    return [
+      jFetch(`${GM}/markets?condition_ids=${csv}&closed=false&limit=${b.length}`),
+      jFetch(`${GM}/markets?condition_ids=${csv}&closed=true&limit=${b.length}`),
+    ];
+  });
+  const results = await Promise.allSettled(calls);
+  results.forEach(res => {
+    if (res.status === "fulfilled" && Array.isArray(res.value)) {
+      res.value.forEach(m => { if (m?.conditionId) map[m.conditionId] = parseMkt(m); });
+    }
+  });
+  return map;
+};
+
+// ── Pulsing dot — signature element ───────────────────────────────────────────
+function Dot({ color, size = 7 }) {
+  return (
+    <div style={{ position: "relative", width: size, height: size, flexShrink: 0 }}>
+      <div style={{ position: "absolute", inset: 0, borderRadius: "50%",
+        background: color, opacity: .22, animation: "ping 1.8s ease-out infinite" }} />
+      <div style={{ position: "absolute", inset: "1px", borderRadius: "50%", background: color }} />
+    </div>
+  );
+}
+
+function RBadge({ score }) {
+  const r = getR(score);
+  return (
+    <span style={{ fontSize: 8, fontWeight: 700, letterSpacing: .4, color: r.c,
+      background: r.bg, border: `1px solid ${r.bd}`,
+      padding: "2px 5px", borderRadius: 3, whiteSpace: "nowrap" }}>
+      {r.label}
+    </span>
+  );
+}
+
+function MiniBar({ label, tier, pts, max }) {
+  const tc = tier === "S" ? T.s : T.a;
+  if (pts === null) return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 7 }}>
+      <div style={{ display: "flex", gap: 5, alignItems: "center" }}>
+        <span style={{ fontSize: 7, color: tc, background: `${tc}18`, fontFamily: T.mono,
+          padding: "1px 3px", borderRadius: 2 }}>{tier}</span>
+        <span style={{ fontSize: 11, color: T.muted }}>{label}</span>
+      </div>
+      <span style={{ fontSize: 9, color: T.dim }}>—</span>
+    </div>
+  );
+  const pct = max > 0 ? (pts / max) * 100 : 0;
+  return (
+    <div style={{ marginBottom: 9 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 3 }}>
+        <div style={{ display: "flex", gap: 5, alignItems: "center" }}>
+          <span style={{ fontSize: 7, color: tc, background: `${tc}18`, fontFamily: T.mono,
+            padding: "1px 3px", borderRadius: 2 }}>{tier}</span>
+          <span style={{ fontSize: 11, color: pts > 0 ? "#C8DCE8" : T.muted }}>{label}</span>
+        </div>
+        <span style={{ fontFamily: T.mono, fontSize: 11, fontWeight: 600,
+          color: pts > 0 ? tc : T.dim }}>{pts}/{max}</span>
+      </div>
+      <div style={{ height: 3, background: T.bg, borderRadius: 2, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${pct}%`, borderRadius: 2,
+          background: pts > 0 ? `linear-gradient(90deg,${tc}55,${tc})` : "#16243A",
+          transition: "width .5s ease" }} />
+      </div>
+    </div>
+  );
+}
+
+// ── Feed row ───────────────────────────────────────────────────────────────────
+function FeedRow({ item, isNew, expanded, onToggle }) {
+  const score = item.fullScore ?? item.quickScore;
+  const maxScore = item.fullMax ?? item.quickMax;
+  const rk = getR(score);
+  const pct = (item.price * 100).toFixed(1);
+  const isLowOdds = parseFloat(pct) < 20;
+  const hrsFmt = item.hours != null
+    ? item.hours < 24 ? `${item.hours.toFixed(1)}h` : `${(item.hours / 24).toFixed(1)}d`
+    : "—";
+  const hrsColor = item.hours != null
+    ? item.hours < 6 ? "#FF3B3B" : item.hours < 24 ? "#FF7A2F" : item.hours < 72 ? T.a : T.dim
+    : T.dim;
+
+  return (
+    <>
+      <tr onClick={onToggle} style={{
+        cursor: "pointer",
+        background: expanded ? `${rk.c}07` : isNew ? "rgba(249,115,22,.03)" : "transparent",
+        borderBottom: `1px solid ${T.bdr}`,
+      }}>
+        <td style={{ padding: "10px 10px 10px 16px" }}><Dot color={rk.c} /></td>
+        <td style={{ padding: "10px 8px" }}><RBadge score={score} /></td>
+        <td style={{ padding: "10px 8px" }}>
+          <span style={{ fontFamily: T.mono, fontSize: 13, fontWeight: 700, color: rk.c }}>{score}</span>
+          <span style={{ fontFamily: T.mono, fontSize: 9, color: T.dim }}>/{maxScore}</span>
+          {item.enriched  && <span style={{ marginLeft: 4, fontSize: 8, color: T.ok }} title="Wallet enriched">✓</span>}
+          {item.enriching && <span style={{ marginLeft: 4, fontSize: 9, color: T.a,
+            display: "inline-block", animation: "spin .8s linear infinite" }}>↻</span>}
+        </td>
+        <td style={{ padding: "10px 8px" }}>
+          <span style={{ fontFamily: T.mono, fontSize: 11, color: "#4A9ABB" }}>
+            {item.addr ? `${item.addr.slice(0,6)}…${item.addr.slice(-4)}` : "—"}
+          </span>
+        </td>
+        <td style={{ padding: "10px 8px" }}>
+          <div style={{ fontSize: 11, color: T.muted, overflow: "hidden",
+            textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 260 }}>
+            {item.title || item.mkt?.question || `${item.conditionId.slice(0,28)}…`}
+          </div>
+        </td>
+        <td style={{ padding: "10px 8px" }}>
+          <span style={{ fontFamily: T.mono, fontSize: 12, fontWeight: 700,
+            color: isLowOdds ? T.s : T.a }}>{pct}%</span>
+        </td>
+        <td style={{ padding: "10px 8px" }}>
+          <span style={{ fontFamily: T.mono, fontSize: 11, color: T.text }}>
+            ${item.size.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+          </span>
+        </td>
+        <td style={{ padding: "10px 8px" }}>
+          <span style={{ fontFamily: T.mono, fontSize: 11, color: hrsColor }}>{hrsFmt}</span>
+        </td>
+        <td style={{ padding: "10px 12px 10px 8px" }}>
+          {item.outcome
+            ? <span style={{ fontSize: 10, fontWeight: 700,
+                color: item.outcome.toLowerCase() === "yes" ? T.ok : "#F87171" }}>
+                {item.outcome.toUpperCase()}
+              </span>
+            : <span style={{ color: T.dim, fontSize: 10 }}>—</span>}
+        </td>
+      </tr>
+
+      {expanded && (
+        <tr style={{ background: `${rk.c}04`, borderBottom: `1px solid ${T.bdr}` }}>
+          <td colSpan={9} style={{ padding: "16px 20px 18px" }}>
+            <div style={{ display: "flex", gap: 28, flexWrap: "wrap" }}>
+
+              <div style={{ minWidth: 250, flex: 1 }}>
+                <div style={{ fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 11 }}>
+                  SIGNAL BREAKDOWN
+                </div>
+                <div style={{ fontSize: 8, color: T.s, letterSpacing: 1.5, fontWeight: 700,
+                  background: `${T.s}12`, padding: "2px 6px", borderRadius: 3,
+                  display: "inline-block", marginBottom: 9 }}>S-TIER · AUTO-COMPUTED</div>
+                <MiniBar label="Entry Odds Level"          tier="S" pts={item.sig_odds ?? 0}  max={18} />
+                <MiniBar label="Pre-Resolution Timing"     tier="S" pts={item.sig_time ?? 0}  max={22} />
+                <MiniBar label="Privacy Bridge Origin"     tier="S" pts={null}                 max={25} />
+                <div style={{ height: 1, background: T.bdr, margin: "9px 0" }} />
+                <div style={{ fontSize: 8, color: T.a, letterSpacing: 1.5, fontWeight: 700,
+                  background: `${T.a}10`, padding: "2px 6px", borderRadius: 3,
+                  display: "inline-block", marginBottom: 9 }}>A-TIER · WALLET DATA</div>
+                <MiniBar label="Historical Win Rate"       tier="A" pts={item.sig_wr}          max={6}  />
+                <MiniBar label="Post-Resolution Dormancy"  tier="A" pts={item.sig_dorm}        max={7}  />
+                <MiniBar label="Wallet Age (WC·TX)"        tier="A" pts={null}                 max={10} />
+                <MiniBar label="Multi-Wallet Coordination" tier="A" pts={null}                 max={12} />
+              </div>
+
+              <div style={{ minWidth: 180 }}>
+                <div style={{ fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 11 }}>
+                  WALLET SNAPSHOT
+                </div>
+                {item.enriching && (
+                  <div style={{ fontSize: 10, color: T.a, display: "flex", gap: 6, alignItems: "center" }}>
+                    <span style={{ display: "inline-block", animation: "spin .8s linear infinite" }}>↻</span>
+                    Loading wallet history…
+                  </div>
+                )}
+                {item.enriched && (
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "7px 18px" }}>
+                    {[
+                      ["Resolved bets",  item.w_resolved ?? "—"],
+                      ["Wins",           item.w_wins ?? "—"],
+                      ["Win rate",       item.w_resolved > 0
+                        ? `${((item.w_wins / item.w_resolved) * 100).toFixed(0)}%` : "—"],
+                      ["Post-win activity", item.w_stillActive != null
+                        ? (item.w_stillActive ? "Yes" : "No 🔴") : "—"],
+                    ].map(([k, v]) => (
+                      <div key={k}>
+                        <div style={{ fontSize: 9, color: T.dim, marginBottom: 2 }}>{k}</div>
+                        <div style={{ fontSize: 11, fontFamily: T.mono, color: T.text }}>{v}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {!item.enriched && !item.enriching && (
+                  <div style={{ fontSize: 10, color: T.dim, lineHeight: 1.7 }}>
+                    Top 3 trades auto-enrich.<br />
+                    Click again after a moment to load wallet stats.
+                  </div>
+                )}
+              </div>
+
+              <div style={{ minWidth: 200 }}>
+                <div style={{ fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 11 }}>
+                  LINKS & MANUAL CHECKS
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 7, marginBottom: 14 }}>
+                  <a href={`https://polygonscan.com/address/${item.addr}#tokentxns`}
+                    target="_blank" rel="noopener noreferrer"
+                    style={{ fontSize: 10, color: T.a, textDecoration: "none", display: "flex",
+                      alignItems: "center", justifyContent: "space-between",
+                      padding: "6px 10px", border: "1px solid rgba(56,189,248,.2)", borderRadius: 5 }}>
+                    <span>Check funding source</span>
+                    <span style={{ opacity: .6 }}>Polygonscan ↗</span>
+                  </a>
+                  {(item.slug || item.mkt?.slug) && (
+                    <a href={`https://polymarket.com/event/${item.slug || item.mkt?.slug}`}
+                      target="_blank" rel="noopener noreferrer"
+                      style={{ fontSize: 10, color: T.muted, textDecoration: "none", display: "flex",
+                        alignItems: "center", justifyContent: "space-between",
+                        padding: "6px 10px", border: `1px solid ${T.bdr}`, borderRadius: 5 }}>
+                      <span>View this market</span>
+                      <span style={{ opacity: .6 }}>Polymarket ↗</span>
+                    </a>
+                  )}
+                  <a href={`https://polygonscan.com/address/${item.addr}`}
+                    target="_blank" rel="noopener noreferrer"
+                    style={{ fontSize: 10, color: T.muted, textDecoration: "none", display: "flex",
+                      alignItems: "center", justifyContent: "space-between",
+                      padding: "6px 10px", border: `1px solid ${T.bdr}`, borderRadius: 5 }}>
+                    <span>Full wallet on-chain</span>
+                    <span style={{ opacity: .6 }}>Polygonscan ↗</span>
+                  </a>
+                </div>
+                <div style={{ fontSize: 9, color: T.dim, lineHeight: 1.8 }}>
+                  <span style={{ color: "#C0480A" }}>● Privacy Bridge (25 pts):</span> Look for Railgun contract inflows<br />
+                  <span style={{ color: "#1E6490" }}>● Multi-Wallet (12 pts):</span> Same funder, same side, same market
+                </div>
+              </div>
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+function Steps({ current }) {
+  const LIST = [
+    ["trades",  "Fetching recent BUY trades from data-api.polymarket.com"],
+    ["markets", "Resolving market end-dates & outcomes from gamma-api.polymarket.com"],
+    ["scoring", "Computing insider signal scores"],
+  ];
+  const idx = LIST.findIndex(([id]) => id === current);
+  return (
+    <div style={{ display: "inline-block", textAlign: "left" }}>
+      {LIST.map(([, label], i) => (
+        <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
+          <div style={{ width: 8, height: 8, borderRadius: "50%", flexShrink: 0,
+            background: i < idx ? T.ok : i === idx ? T.a : T.dim,
+            boxShadow: i === idx ? `0 0 8px ${T.a}` : "none" }} />
+          <span style={{ fontSize: 11, color: i < idx ? T.ok : i === idx ? T.text : T.dim }}>{label}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── App ────────────────────────────────────────────────────────────────────────
+function App() {
+  const [minSize,  setMinSize]  = useState(1000);
+  const [minScore, setMinScore] = useState(8);
+  const [autoRef,  setAutoRef]  = useState(true);
+  const [showCtrl, setShowCtrl] = useState(false);
+  const [sortBy,   setSortBy]   = useState("score");
+
+  const [feed,     setFeed]     = useState([]);
+  const [phase,    setPhase]    = useState("trades"); // trades|markets|scoring|done|err
+  const [fetched,  setFetched]  = useState(0);
+  const [lastUpd,  setLastUpd]  = useState(null);
+  const [expanded, setExpanded] = useState(new Set());
+  const [newIds,   setNewIds]   = useState(new Set());
+  const [errMsg,   setErrMsg]   = useState("");
+
+  const mktCache  = useRef({});
+  const wCache    = useRef({});
+  const prevIds   = useRef(new Set());
+  const timerRef  = useRef(null);
+  const scanningR = useRef(false);
+  const minSizeR  = useRef(minSize);
+  const minScoreR = useRef(minScore);
+
+  useEffect(() => { minSizeR.current  = minSize;  }, [minSize]);
+  useEffect(() => { minScoreR.current = minScore; }, [minScore]);
+
+  const scanning = ["trades", "markets", "scoring"].includes(phase) && scanningR.current;
+
+  // ── Enrich one wallet with trade history (win rate + dormancy) ─────────────
+  const enrich = useCallback(async (item) => {
+    if (!item.addr) return;
+
+    if (wCache.current[item.addr]) {
+      const w = wCache.current[item.addr];
+      setFeed(prev => prev.map(r => r.id !== item.id ? r : {
+        ...r, ...w, enriched: true, enriching: false,
+        fullScore: r.quickScore + (w.sig_wr || 0) + (w.sig_dorm ?? 0),
+        fullMax:   r.quickMax + 13,
+      }));
+      return;
+    }
+
+    setFeed(prev => prev.map(r => r.id === item.id ? { ...r, enriching: true } : r));
+
+    try {
+      const raw = await jFetch(`${DA}/trades?user=${item.addr}&side=BUY&limit=100`);
+      const wTrades = Array.isArray(raw) ? raw.map(parseTrade) : [];
+
+      // Cap market lookups to the 50 most recent positions to limit proxy calls.
+      const wIds = wTrades.map(t => t.conditionId).filter(id => !mktCache.current[id]).slice(0, 50);
+      const fetched = await fetchMarketsByConditionIds(wIds);
+      Object.assign(mktCache.current, fetched);
+
+      const resolved = wTrades.filter(t => mktCache.current[t.conditionId]?.closed);
+      const wins     = resolved.filter(t => didWin(t, mktCache.current[t.conditionId]) === true).length;
+      const resTimes = resolved.map(t => t.ts).filter(Boolean).sort((a, b) => b - a);
+      const afterWin = resTimes.length > 0
+        ? wTrades.filter(t => t.ts && t.ts > resTimes[0]).length
+        : null;
+
+      const sig_wr   = scoreWR(wins, resolved.length);
+      const sig_dorm = scoreDorm(afterWin);
+      const wData = {
+        sig_wr, sig_dorm,
+        w_resolved: resolved.length, w_wins: wins,
+        w_stillActive: afterWin !== null ? afterWin > 1 : null,
+        enriched: true, enriching: false,
+      };
+      wCache.current[item.addr] = wData;
+
+      setFeed(prev => prev.map(r => r.id !== item.id ? r : {
+        ...r, ...wData,
+        fullScore: r.quickScore + sig_wr + (sig_dorm ?? 0),
+        fullMax:   r.quickMax + 13,
+      }));
+    } catch {
+      setFeed(prev => prev.map(r => r.id === item.id
+        ? { ...r, enriching: false, enriched: false } : r));
+    }
+  }, []);
+
+  // ── Main scan ───────────────────────────────────────────────────────────────
+  const scan = useCallback(async () => {
+    if (scanningR.current) return;
+    scanningR.current = true;
+    setErrMsg("");
+    setPhase("trades");
+
+    try {
+      const url = `${DA}/trades?limit=200&side=BUY&filterType=CASH&filterAmount=${minSizeR.current}`;
+      const raw = await jFetch(url);
+      if (!Array.isArray(raw)) throw new Error("Unexpected response shape from Polymarket API.");
+
+      const trades = raw.map(parseTrade)
+        .filter(t => t.addr && t.conditionId && t.size >= minSizeR.current); // belt-and-suspenders
+      setFetched(trades.length);
+
+      setPhase("markets");
+      // Trades arrive most-recent-first; cap market lookups to the latest 100
+      // so the number of proxied gamma calls stays small (≤4) even on a big scan.
+      const needed = trades.slice(0, 100)
+        .map(t => t.conditionId).filter(id => !mktCache.current[id]);
+      const fetchedMkts = await fetchMarketsByConditionIds(needed);
+      Object.assign(mktCache.current, fetchedMkts);
+
+      setPhase("scoring");
+      const scored = trades.map(t => {
+        const m     = mktCache.current[t.conditionId] || null;
+        const hours = m?.endDate && t.ts ? (m.endDate - t.ts) / 3_600_000 : null;
+        const sig_odds = scoreOdds(t.price * 100);
+        const sig_time = hours !== null ? scoreTiming(hours) : 0;
+        return {
+          ...t, mkt: m,
+          sig_odds, sig_time, sig_wr: null, sig_dorm: null,
+          hours, quickScore: sig_odds + sig_time, quickMax: 40,
+          fullScore: null, fullMax: null,
+          enriched: false, enriching: false,
+        };
+      }).filter(t => t.quickScore >= minScoreR.current);
+
+      const seen = new Map();
+      scored.forEach(t => {
+        const key = `${t.addr}|${t.conditionId}`;
+        if (!seen.has(key) || t.quickScore > seen.get(key).quickScore) seen.set(key, t);
+      });
+      const deduped = [...seen.values()].sort((a, b) => b.quickScore - a.quickScore);
+
+      const fresh = new Set(deduped.filter(t => !prevIds.current.has(t.id)).map(t => t.id));
+      prevIds.current = new Set(deduped.map(t => t.id));
+      setNewIds(fresh);
+
+      setFeed(deduped);
+      setLastUpd(new Date());
+      setPhase("done");
+
+      // Auto-enrich the top 3 (each adds several proxied calls; users can
+      // expand any other row to enrich it on demand).
+      deduped.slice(0, 3).forEach(t => enrich(t));
+    } catch (e) {
+      if (isNetworkBlock(e)) {
+        setErrMsg("Couldn't reach Polymarket — tried a direct call plus two public CORS proxies and all were blocked. This is an environment/network limit, not a code bug: the sandbox or your network is blocking outbound requests, or the public proxies are rate-limited or down right now. Options: (1) hit ↻ SCAN NOW again in a minute — proxy availability fluctuates; (2) run this from your own page behind a Vite dev-server proxy or a tiny Node/serverless fetch relay, which is the bulletproof path. The scoring logic itself is verified against Polymarket's documented API schema.");
+      } else {
+        setErrMsg(e.message || "Scan failed.");
+      }
+      setPhase("err");
+    }
+    scanningR.current = false;
+  }, [enrich]);
+
+  useEffect(() => { scan(); }, []); // eslint-disable-line
+
+  useEffect(() => {
+    clearInterval(timerRef.current);
+    if (autoRef) timerRef.current = setInterval(scan, 60_000);
+    return () => clearInterval(timerRef.current);
+  }, [autoRef, scan]);
+
+  const sorted = [...feed].sort((a, b) => {
+    const as = a.fullScore ?? a.quickScore;
+    const bs = b.fullScore ?? b.quickScore;
+    if (sortBy === "score") return bs - as;
+    if (sortBy === "size")  return b.size - a.size;
+    if (sortBy === "odds")  return a.price - b.price;
+    if (sortBy === "time")  return (a.hours ?? 9999) - (b.hours ?? 9999);
+    return bs - as;
+  });
+
+  const toggle = id => {
+    setExpanded(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) { next.delete(id); return next; }
+      next.add(id);
+      const item = feed.find(t => t.id === id);
+      if (item && !item.enriched && !item.enriching) enrich(item);
+      return next;
+    });
+  };
+
+  const critCount = feed.filter(t => (t.fullScore ?? t.quickScore) >= 60).length;
+  const highCount = feed.filter(t => (t.fullScore ?? t.quickScore) >= 40).length;
+
+  return (
+    <div style={{ background: T.bg, minHeight: "100vh", color: T.text,
+      fontFamily: "'Inter', system-ui, sans-serif", fontSize: 13 }}>
+      <style>{`
+        @keyframes ping  { 0%,100%{opacity:.2;transform:scale(1)} 60%{opacity:.5;transform:scale(2.4)} }
+        @keyframes spin  { to{transform:rotate(360deg)} }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+        * { box-sizing: border-box; }
+        input::placeholder { color: #1E3040; }
+        ::-webkit-scrollbar { width: 5px; height: 5px; }
+        ::-webkit-scrollbar-track { background: #07080F; }
+        ::-webkit-scrollbar-thumb { background: #283848; border-radius: 3px; }
+        tbody tr:hover td { background: rgba(255,255,255,.012); }
+        a:hover { opacity: .8; }
+        button { transition: opacity .12s, border-color .12s; }
+      `}</style>
+
+      {/* ── Header ──────────────────────────────────────────────────────── */}
+      <div style={{ borderBottom: `1px solid ${T.bdr}`, padding: "11px 18px" }}>
+        <div style={{ maxWidth: 1240, margin: "0 auto",
+          display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 2 }}>
+              <span style={{ fontFamily: T.mono, fontSize: 14, fontWeight: 700, letterSpacing: 2.5 }}>
+                POLYMARKET INSIDER SCREENER
+              </span>
+              <div style={{ display: "flex", alignItems: "center", gap: 6,
+                background: "rgba(74,222,128,.07)", border: "1px solid rgba(74,222,128,.18)",
+                padding: "2px 8px 2px 6px", borderRadius: 3 }}>
+                <div style={{ width: 5, height: 5, borderRadius: "50%", background: T.ok,
+                  animation: "pulse 1.6s ease-in-out infinite" }} />
+                <span style={{ fontSize: 8, fontWeight: 700, color: T.ok, letterSpacing: 2 }}>LIVE FEED</span>
+              </div>
+              {critCount > 0 && (
+                <div style={{ display: "flex", alignItems: "center", gap: 5,
+                  background: "rgba(255,59,59,.08)", border: "1px solid rgba(255,59,59,.22)",
+                  padding: "2px 8px", borderRadius: 3 }}>
+                  <Dot color="#FF3B3B" size={6} />
+                  <span style={{ fontSize: 8, color: "#FF7A7A", fontFamily: T.mono }}>
+                    {critCount} HIGH/CRITICAL
+                  </span>
+                </div>
+              )}
+            </div>
+            <div style={{ fontSize: 10, color: T.dim }}>
+              data-api.polymarket.com via CORS-proxy fallback · server-filtered by $ size + side · 5 auto-signals · refresh 60s
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <button onClick={() => setShowCtrl(p => !p)} style={{
+              background: "transparent", border: `1px solid ${showCtrl ? "rgba(56,189,248,.3)" : T.bdr}`,
+              color: showCtrl ? T.a : T.muted, padding: "7px 12px",
+              borderRadius: 5, cursor: "pointer", fontSize: 11,
+            }}>⚙ Filters</button>
+            <button onClick={scan} disabled={scanning} style={{
+              background: scanning ? "transparent" : "rgba(56,189,248,.10)",
+              border: "1px solid rgba(56,189,248,.28)", color: T.a,
+              padding: "7px 16px", borderRadius: 5, cursor: scanning ? "default" : "pointer",
+              fontSize: 11, fontWeight: 700, letterSpacing: .5, opacity: scanning ? .4 : 1,
+            }}>{scanning ? "SCANNING…" : "↻ SCAN NOW"}</button>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Filters strip ────────────────────────────────────────────────── */}
+      {showCtrl && (
+        <div style={{ borderBottom: `1px solid ${T.bdr}`, padding: "12px 18px", background: "rgba(12,17,32,.9)" }}>
+          <div style={{ maxWidth: 1240, margin: "0 auto", display: "flex", gap: 24, flexWrap: "wrap", alignItems: "flex-end" }}>
+            <div>
+              <div style={{ fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 }}>
+                MIN TRADE SIZE ($)
+              </div>
+              <div style={{ display: "flex", gap: 5 }}>
+                {[[500,"$500"],[1000,"$1K"],[5000,"$5K"],[10000,"$10K"]].map(([v, l]) => (
+                  <button key={v} onClick={() => setMinSize(v)} style={{
+                    padding: "5px 10px", fontSize: 10, fontFamily: T.mono,
+                    background: minSize === v ? "rgba(56,189,248,.14)" : "transparent",
+                    border: `1px solid ${minSize === v ? "rgba(56,189,248,.35)" : T.bdr}`,
+                    color: minSize === v ? T.a : T.muted, borderRadius: 4, cursor: "pointer",
+                  }}>{l}</button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 }}>
+                MIN SCORE (of 40 auto-pts)
+              </div>
+              <div style={{ display: "flex", gap: 5 }}>
+                {[[5,"5+"],[8,"8+"],[12,"12+"],[18,"18+"],[22,"22+"]].map(([v, l]) => (
+                  <button key={v} onClick={() => setMinScore(v)} style={{
+                    padding: "5px 10px", fontSize: 10, fontFamily: T.mono,
+                    background: minScore === v ? "rgba(249,115,22,.14)" : "transparent",
+                    border: `1px solid ${minScore === v ? "rgba(249,115,22,.35)" : T.bdr}`,
+                    color: minScore === v ? T.s : T.muted, borderRadius: 4, cursor: "pointer",
+                  }}>{l}</button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 }}>
+                AUTO-REFRESH
+              </div>
+              <button onClick={() => setAutoRef(p => !p)} style={{
+                padding: "5px 12px", fontSize: 10,
+                background: autoRef ? "rgba(74,222,128,.10)" : "transparent",
+                border: `1px solid ${autoRef ? "rgba(74,222,128,.28)" : T.bdr}`,
+                color: autoRef ? T.ok : T.muted, borderRadius: 4, cursor: "pointer",
+              }}>{autoRef ? "ON · every 60s" : "OFF"}</button>
+            </div>
+            <div style={{ fontSize: 10, color: T.dim, lineHeight: 1.7, marginLeft: "auto", maxWidth: 280 }}>
+              Size &amp; side filtered server-side via Polymarket's <code style={{ color: T.muted }}>filterType=CASH</code> param —
+              fetches only matching trades, not a haystack to discard client-side.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Stats bar ───────────────────────────────────────────────────── */}
+      <div style={{ borderBottom: `1px solid ${T.bdr}`, padding: "7px 18px" }}>
+        <div style={{ maxWidth: 1240, margin: "0 auto", display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap" }}>
+          {[
+            ["Trades fetched",  fetched || (scanning ? "…" : "0")],
+            ["Flagged",         feed.length || (scanning ? "…" : "0")],
+            ["HIGH+",           highCount],
+            ["Wallet-enriched", feed.filter(t => t.enriched).length],
+            ["Min size",        `$${minSize.toLocaleString()}`],
+            ["Min score",       `${minScore}+`],
+            ["Last scan",       lastUpd ? lastUpd.toLocaleTimeString() : "—"],
+            ["Route",           lastUpd ? (PROXY_USED || "—") : "—"],
+          ].map(([k, v]) => (
+            <div key={k} style={{ display: "flex", gap: 5, alignItems: "center" }}>
+              <span style={{ fontSize: 9, color: T.dim }}>{k}:</span>
+              <span style={{ fontFamily: T.mono, fontSize: 11, color: T.text }}>{v}</span>
+            </div>
+          ))}
+          {scanning && (
+            <div style={{ display: "flex", gap: 6, alignItems: "center", marginLeft: 4 }}>
+              <div style={{ width: 7, height: 7, border: `1.5px solid ${T.bdr}`,
+                borderTop: `1.5px solid ${T.a}`, borderRadius: "50%", animation: "spin .7s linear infinite" }} />
+              <span style={{ fontSize: 9, color: T.a, letterSpacing: 1 }}>scanning</span>
+            </div>
+          )}
+          <div style={{ marginLeft: "auto", display: "flex", gap: 5, alignItems: "center" }}>
+            <span style={{ fontSize: 9, color: T.dim }}>Sort:</span>
+            {[["score","Score"],["size","Size"],["odds","Odds %"],["time","Pre-Res"]].map(([v, l]) => (
+              <button key={v} onClick={() => setSortBy(v)} style={{
+                padding: "2px 8px", fontSize: 9,
+                background: sortBy === v ? "rgba(56,189,248,.10)" : "transparent",
+                border: `1px solid ${sortBy === v ? "rgba(56,189,248,.25)" : T.bdr}`,
+                color: sortBy === v ? T.a : T.dim, borderRadius: 3, cursor: "pointer",
+              }}>{l}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Feed table ──────────────────────────────────────────────────── */}
+      <div style={{ maxWidth: 1240, margin: "0 auto", padding: "0 0 36px" }}>
+
+        {errMsg && (
+          <div style={{ margin: "16px 18px", padding: "12px 14px",
+            background: "rgba(255,59,59,.06)", border: "1px solid rgba(255,59,59,.2)", borderRadius: 6 }}>
+            <span style={{ fontSize: 11, color: "#FF7A7A", lineHeight: 1.7 }}>⚠ {errMsg}</span>
+          </div>
+        )}
+
+        {scanning && feed.length === 0 && (
+          <div style={{ textAlign: "center", padding: "60px 16px" }}>
+            <div style={{ width: 44, height: 44, margin: "0 auto 18px",
+              border: `3px solid ${T.bdr}`, borderTop: `3px solid ${T.a}`,
+              borderRadius: "50%", animation: "spin .8s linear infinite" }} />
+            <div style={{ fontSize: 12, color: T.a, fontFamily: T.mono, letterSpacing: 2, marginBottom: 14 }}>
+              SCANNING POLYMARKET
+            </div>
+            <Steps current={phase} />
+          </div>
+        )}
+
+        {!scanning && feed.length === 0 && phase === "done" && (
+          <div style={{ textAlign: "center", padding: "60px 16px" }}>
+            <div style={{ fontSize: 28, marginBottom: 12 }}>✓</div>
+            <div style={{ fontSize: 13, color: T.ok, marginBottom: 8 }}>No flagged trades this scan</div>
+            <div style={{ fontSize: 11, color: T.dim, lineHeight: 1.8 }}>
+              {fetched} trades ≥${minSize.toLocaleString()} fetched · none scored ≥{minScore}.
+              <br />Try lowering filters, or wait for the next auto-refresh.
+            </div>
+          </div>
+        )}
+
+        {sorted.length > 0 && (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed", minWidth: 820 }}>
+              <colgroup>
+                <col style={{ width: 32 }} /><col style={{ width: 84 }} /><col style={{ width: 76 }} />
+                <col style={{ width: 114 }} /><col /><col style={{ width: 76 }} />
+                <col style={{ width: 94 }} /><col style={{ width: 76 }} /><col style={{ width: 60 }} />
+              </colgroup>
+              <thead>
+                <tr style={{ borderBottom: `1px solid ${T.bdr}` }}>
+                  {["","RISK","SCORE","WALLET","MARKET","ENTRY %","SIZE","PRE-RES","SIDE"].map((h, i) => (
+                    <th key={i} style={{
+                      padding: `8px 8px 8px ${i === 0 ? "16px" : "8px"}`,
+                      fontSize: 8, color: T.dim, letterSpacing: 1.8, fontWeight: 700,
+                      textAlign: "left", whiteSpace: "nowrap",
+                    }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {sorted.map(item => (
+                  <FeedRow key={item.id} item={item} isNew={newIds.has(item.id)}
+                    expanded={expanded.has(item.id)} onToggle={() => toggle(item.id)} />
+                ))}
+              </tbody>
+            </table>
+            <div style={{ padding: "12px 18px", borderTop: `1px solid ${T.bdr}` }}>
+              <span style={{ fontSize: 9, color: T.dim, lineHeight: 1.8 }}>
+                {sorted.length} flagged · sorted by {sortBy} ·{" "}
+                Quick score (auto) = Entry Odds (S·18) + Pre-Resolution Timing (S·22) ·{" "}
+                Full score adds Win Rate (A·6) + Dormancy (A·7) after wallet enrichment ·{" "}
+                Privacy Bridge (S·25) + Wallet Age (A·10) + Multi-Wallet (A·12) require manual checks via expanded rows ·{" "}
+                Click any row to expand
+              </span>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
