@@ -137,18 +137,21 @@ const parsePosition = r => {
         endDate: tsToDate(r.endDate),
     });
 };
-// ── Sports / crypto exclusion ──────────────────────────────────────────────────
-// Insider trading needs non-public info about a deterministic outcome. Sports
-// (outcome doesn't exist yet) and crypto price markets (resolve on public feeds)
-// don't qualify, so we drop them. Matching is on the trade's own `title` — no
-// gamma call needed. Tuned to NOT catch court cases ("X v. Y" keeps the single
-// "v.") or policy/election markets (the word "win" alone isn't enough).
-const SPORTS_RE = /\b(vs\.?|o\/u|over\/under|moneyline|spread|exact score|both teams to score|bo[35]|fifa|uefa|nba|nfl|nhl|mlb|ncaa|ufc|mma|nascar|formula 1|grand prix|premier league|la liga|serie a|bundesliga|ligue 1|champions league|europa league|copa america|copa libertadores|euro 2028|the ashes|mls|world cup|super bowl|stanley cup|world series|wimbledon|us open|the masters|ryder cup|counter-strike|cs:?go|cs2|dota|league of legends|valorant|overwatch|rocket league|esports|playoffs)\b/i;
-const SPORTS_PHRASE_RE = /\bwin\b.*\b(cup|championship|league|title|tournament|final|finals|series|open|match|game|medal|gold)\b/i;
-const CRYPTO_RE = /\b(up or down|bitcoin|ethereum|solana|cardano|dogecoin|ripple|litecoin|polkadot|avalanche|chainlink|shiba inu|crypto|cryptocurrency|altcoin|stablecoin|flippening)\b/i;
-const CRYPTO_TICKER_RE = /\b(BTC|ETH|SOL|XRP|DOGE|ADA|BNB|LTC|DOT|AVAX|LINK|SHIB|TRX)\b/; // case-sensitive: tickers are uppercase
-const isNoise = (title = "") => SPORTS_RE.test(title) || SPORTS_PHRASE_RE.test(title) ||
-    CRYPTO_RE.test(title) || CRYPTO_TICKER_RE.test(title);
+// ── Political / geopolitical allowlist ─────────────────────────────────────────
+// Insider trading needs non-public info about a deterministic outcome. That
+// concentrates in politics, governance, geopolitics, legal/regulatory, corporate
+// actions, and macro data — NOT sports (outcome doesn't exist yet) or crypto
+// (resolves on public price feeds). Rather than blocklist the endless parade of
+// noise formats (meme markets, weather, social metrics…), we ALLOWLIST the
+// categories where insider patterns are possible. Matching is on the trade's own
+// `title` — no gamma call. Tuned against real feed titles + tracked markets.
+const GOV_RE = /\b(election|elected|electoral|president|presiden\w+|prime minister|mayor|mayoral|governor|gubernatorial|senator|senate|congress\w*|parliament\w*|chancellor|candidate|nominee|nominn?ation|nominated|primary|primaries|ballot|referendum|coalition|cabinet|incumbent|impeach\w*|inaugurat\w*|re-?elect\w*|GOP|republican|democrat|tory|tories|labour party|conservative party)\b/i;
+const OFFICE_RE = /\b(resign\w*|step down|steps down|stepping down|ousted?|out as|removed from office|leaves? office|leaving office|leaves? power|in power|remain in power|stay in power|seize power|hold office|approval rating|no[- ]confidence|vote of no confidence)\b/i;
+const GEO_RE = /\b(cease[- ]?fire|armistice|peace deal|peace talks|peace agreement|truce|sanction\w*|embargo|treaty|summit|NATO|united nations|G7|G20|nuclear|air ?strike|military strike|missile strike|missile|invasion|invade|coup|regime|overthrow|annex\w*|hostage|prisoner swap|strait of hormuz|hormuz|strait|drone strike|martial law|deploy troops|troops to|declares? war|go to war|war (before|by|with|breaks out)|strike (iran|israel|russia|china|north korea|ukraine|gaza|taiwan|syria))\b/i;
+const LEGAL_RE = /\b(SEC|FDA|FTC|DOJ|FBI|CIA|antitrust|indict\w*|convicted|verdict|ruling|supreme court|SCOTUS|lawsuit|subpoena|FISA|reauthoriz\w*|confirmed as|merger|acquisition|IPO|bankruptcy|delisting|recall|investigation|probe|CEO|fired as|sued?|pardon|executive order|extradit\w*|state of emergency)\b/i;
+const MACRO_RE = /\b(fed|FOMC|interest rate|rate (cut|hike|decision)|powell|inflation|CPI|recession|GDP|unemployment|jobs report|debt ceiling|shutdown|government shutdown|budget|tariff\w*|trade deal|debt default)\b/i;
+const isRelevant = (title = "") => GOV_RE.test(title) || OFFICE_RE.test(title) || GEO_RE.test(title) ||
+    LEGAL_RE.test(title) || MACRO_RE.test(title);
 function Dot({ color, size = 7 }) {
     return (React.createElement("div", { style: { position: "relative", width: size, height: size, flexShrink: 0 } },
         React.createElement("div", { style: { position: "absolute", inset: 0, borderRadius: "50%",
@@ -304,7 +307,7 @@ function App() {
     const [minCash, setMinCash] = useState(1000);
     const [minScore, setMinScore] = useState(5);
     const [autoRef, setAutoRef] = useState(true);
-    const [excludeNoise, setExcludeNoise] = useState(true);
+    const [excludeNoise, setExcludeNoise] = useState(true); // politics/geo allowlist on by default
     const [showCtrl, setShowCtrl] = useState(false);
     const [sortBy, setSortBy] = useState("score");
     const [feed, setFeed] = useState([]);
@@ -321,10 +324,10 @@ function App() {
     const scanningR = useRef(false);
     const minCashR = useRef(minCash);
     const minScoreR = useRef(minScore);
-    const excludeNoiseR = useRef(excludeNoise);
+    const politicsOnlyR = useRef(excludeNoise);
     useEffect(() => { minCashR.current = minCash; }, [minCash]);
     useEffect(() => { minScoreR.current = minScore; }, [minScore]);
-    useEffect(() => { excludeNoiseR.current = excludeNoise; }, [excludeNoise]);
+    useEffect(() => { politicsOnlyR.current = excludeNoise; }, [excludeNoise]);
     const scanning = ["trades", "scoring", "enrich"].includes(phase) && scanningR.current;
     const enrich = useCallback(async (item) => {
         if (!item.addr)
@@ -383,8 +386,8 @@ function App() {
                 throw new Error("Unexpected response from data-api.");
             setPhase("scoring");
             const buys = raw.map(parseTrade).filter(t => t.side === "BUY" && t.addr && t.conditionId && t.cash >= minCashR.current);
-            // Split out sports/crypto noise (by title) before scoring.
-            const kept = excludeNoiseR.current ? buys.filter(t => !isNoise(t.title)) : buys;
+            // Allowlist: keep only politics/geopolitics/legal/macro markets (by title).
+            const kept = politicsOnlyR.current ? buys.filter(t => isRelevant(t.title)) : buys;
             setExcluded(buys.length - kept.length);
             const trades = kept;
             setFetched(raw.length);
@@ -431,7 +434,7 @@ function App() {
     useEffect(() => {
         clearInterval(timerRef.current);
         if (autoRef)
-            timerRef.current = setInterval(scan, 60000);
+            timerRef.current = setInterval(scan, 600000); // 10 minutes
         return () => clearInterval(timerRef.current);
     }, [autoRef, scan]);
     const sorted = [...feed].sort((a, b) => {
@@ -490,7 +493,7 @@ function App() {
                             React.createElement("span", { style: { fontSize: 8, color: "#FF7A7A", fontFamily: T.mono } },
                                 critCount,
                                 " HIGH/CRIT")))),
-                    React.createElement("div", { style: { fontSize: 10, color: T.dim } }, "data-api \u00B7 politics & geopolitics focus (sports + crypto excluded) \u00B7 cash = price\u00D7size \u00B7 timing from positions")),
+                    React.createElement("div", { style: { fontSize: 10, color: T.dim } }, "data-api \u00B7 politics/geo allowlist (sports, crypto, meme markets hidden) \u00B7 cash = price\u00D7size \u00B7 timing from positions")),
                 React.createElement("div", { style: { display: "flex", gap: 8, alignItems: "center" } },
                     React.createElement("button", { onClick: () => setShowCtrl(p => !p), style: { background: "transparent", border: `1px solid ${showCtrl ? "rgba(56,189,248,.3)" : T.bdr}`, color: showCtrl ? T.a : T.muted, padding: "7px 12px", borderRadius: 5, cursor: "pointer", fontSize: 11 } }, "\u2699 Filters"),
                     React.createElement("button", { onClick: scan, disabled: scanning, style: { background: scanning ? "transparent" : "rgba(56,189,248,.10)", border: "1px solid rgba(56,189,248,.28)", color: T.a, padding: "7px 16px", borderRadius: 5, cursor: scanning ? "default" : "pointer", fontSize: 11, fontWeight: 700, letterSpacing: .5, opacity: scanning ? .4 : 1 } }, scanning ? "SCANNING…" : "↻ SCAN NOW")))),
@@ -504,16 +507,16 @@ function App() {
                     React.createElement("div", { style: { display: "flex", gap: 5 } }, [[0, "all"], [5, "5+"], [10, "10+"], [14, "14+"], [18, "18"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMinScore(v), style: { padding: "5px 10px", fontSize: 10, fontFamily: T.mono, background: minScore === v ? "rgba(249,115,22,.14)" : "transparent", border: `1px solid ${minScore === v ? "rgba(249,115,22,.35)" : T.bdr}`, color: minScore === v ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, l))))),
                 React.createElement("div", null,
                     React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "AUTO-REFRESH"),
-                    React.createElement("button", { onClick: () => setAutoRef(p => !p), style: { padding: "5px 12px", fontSize: 10, background: autoRef ? "rgba(74,222,128,.10)" : "transparent", border: `1px solid ${autoRef ? "rgba(74,222,128,.28)" : T.bdr}`, color: autoRef ? T.ok : T.muted, borderRadius: 4, cursor: "pointer" } }, autoRef ? "ON · 60s" : "OFF")),
+                    React.createElement("button", { onClick: () => setAutoRef(p => !p), style: { padding: "5px 12px", fontSize: 10, background: autoRef ? "rgba(74,222,128,.10)" : "transparent", border: `1px solid ${autoRef ? "rgba(74,222,128,.28)" : T.bdr}`, color: autoRef ? T.ok : T.muted, borderRadius: 4, cursor: "pointer" } }, autoRef ? "ON · 10m" : "OFF")),
                 React.createElement("div", null,
-                    React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "EXCLUDE SPORTS + CRYPTO"),
-                    React.createElement("button", { onClick: () => setExcludeNoise(p => !p), style: { padding: "5px 12px", fontSize: 10, background: excludeNoise ? "rgba(249,115,22,.12)" : "transparent", border: `1px solid ${excludeNoise ? "rgba(249,115,22,.32)" : T.bdr}`, color: excludeNoise ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, excludeNoise ? "ON · filtering" : "OFF · show all")),
-                React.createElement("div", { style: { fontSize: 10, color: T.dim, lineHeight: 1.7, marginLeft: "auto", maxWidth: 290 } }, "Pre-enrich score is Entry Odds only (0\u201318). Timing (+22), Win Rate (+6), Dormancy (+7) fill in as each wallet's positions load. Privacy Bridge & Wallet Age remain manual via row links.")))),
+                    React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "POLITICS / GEO ONLY"),
+                    React.createElement("button", { onClick: () => setExcludeNoise(p => !p), style: { padding: "5px 12px", fontSize: 10, background: excludeNoise ? "rgba(249,115,22,.12)" : "transparent", border: `1px solid ${excludeNoise ? "rgba(249,115,22,.32)" : T.bdr}`, color: excludeNoise ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, excludeNoise ? "ON · allowlist" : "OFF · show all")),
+                React.createElement("div", { style: { fontSize: 10, color: T.dim, lineHeight: 1.7, marginLeft: "auto", maxWidth: 290 } }, "POLITICS/GEO ONLY surfaces only markets where insider info is possible: elections, appointments, resignations, sanctions, ceasefires, nuclear, courts/SEC/FDA/FBI, Fed/inflation. Sports, crypto, weather & meme markets are hidden. Flip OFF to see everything.")))),
         React.createElement("div", { style: { borderBottom: `1px solid ${T.bdr}`, padding: "7px 18px" } },
             React.createElement("div", { style: { maxWidth: 1240, margin: "0 auto", display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap" } },
                 [
                     ["Trades pulled", fetched || (scanning ? "…" : "0")],
-                    ["Excluded", excludeNoise ? excluded : "off"],
+                    ["Off-topic cut", excludeNoise ? excluded : "off"],
                     ["Flagged", feed.length || (scanning ? "…" : "0")],
                     ["HIGH+", highCount],
                     ["Enriched", feed.filter(t => t.enriched).length],
