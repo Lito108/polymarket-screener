@@ -159,6 +159,49 @@ const LEGAL_RE = /\b(SEC|FDA|FTC|DOJ|FBI|CIA|antitrust|indict\w*|convicted|verdi
 const MACRO_RE = /\b(fed|FOMC|interest rate|rate (cut|hike|decision)|powell|inflation|CPI|recession|GDP|unemployment|jobs report|debt ceiling|shutdown|government shutdown|budget|tariff\w*|trade deal|debt default)\b/i;
 const isRelevant = (title = "") => GOV_RE.test(title) || OFFICE_RE.test(title) || GEO_RE.test(title) ||
     LEGAL_RE.test(title) || MACRO_RE.test(title);
+// ── Alert bell (Web Audio — no asset needed) ───────────────────────────────────
+// A short bell "ding" played after a refresh when flagged trades are present.
+// Browsers block audio until the user interacts with the page, so unlockAudio()
+// is wired to the first click/keypress; everything fails silently if blocked.
+let _audioCtx = null;
+function unlockAudio() {
+    try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (Ctx && !_audioCtx)
+            _audioCtx = new Ctx();
+        if (_audioCtx && _audioCtx.state === "suspended")
+            _audioCtx.resume();
+    }
+    catch (e) { /* silent */ }
+}
+function playBell() {
+    try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx)
+            return;
+        if (!_audioCtx)
+            _audioCtx = new Ctx();
+        const ctx = _audioCtx;
+        if (ctx.state === "suspended")
+            ctx.resume();
+        const now = ctx.currentTime;
+        // Two partials (A5 + a fifth) give a pleasant bell-like timbre.
+        [880, 1320].forEach((freq, i) => {
+            const osc = ctx.createOscillator();
+            const g = ctx.createGain();
+            osc.type = "sine";
+            osc.frequency.value = freq;
+            const peak = i === 0 ? 0.22 : 0.10;
+            g.gain.setValueAtTime(0.0001, now);
+            g.gain.exponentialRampToValueAtTime(peak, now + 0.012);
+            g.gain.exponentialRampToValueAtTime(0.0001, now + 1.1);
+            osc.connect(g).connect(ctx.destination);
+            osc.start(now);
+            osc.stop(now + 1.2);
+        });
+    }
+    catch (e) { /* silent */ }
+}
 function Dot({ color, size = 7 }) {
     return (React.createElement("div", { style: { position: "relative", width: size, height: size, flexShrink: 0 } },
         React.createElement("div", { style: { position: "absolute", inset: 0, borderRadius: "50%",
@@ -315,6 +358,7 @@ function App() {
     const [minScore, setMinScore] = useState(5);
     const [autoRef, setAutoRef] = useState(true);
     const [excludeNoise, setExcludeNoise] = useState(true); // politics/geo allowlist on by default
+    const [soundOn, setSoundOn] = useState(true); // bell on flagged trades
     const [showCtrl, setShowCtrl] = useState(false);
     const [sortBy, setSortBy] = useState("score");
     const [feed, setFeed] = useState([]);
@@ -335,6 +379,22 @@ function App() {
     useEffect(() => { minCashR.current = minCash; }, [minCash]);
     useEffect(() => { minScoreR.current = minScore; }, [minScore]);
     useEffect(() => { politicsOnlyR.current = excludeNoise; }, [excludeNoise]);
+    const soundOnR = useRef(soundOn);
+    useEffect(() => { soundOnR.current = soundOn; }, [soundOn]);
+    // Unlock audio on the first user interaction (browser autoplay policy).
+    useEffect(() => {
+        const h = () => {
+            unlockAudio();
+            window.removeEventListener("pointerdown", h);
+            window.removeEventListener("keydown", h);
+        };
+        window.addEventListener("pointerdown", h);
+        window.addEventListener("keydown", h);
+        return () => {
+            window.removeEventListener("pointerdown", h);
+            window.removeEventListener("keydown", h);
+        };
+    }, []);
     const scanning = ["trades", "scoring", "enrich"].includes(phase) && scanningR.current;
     const enrich = useCallback(async (item) => {
         if (!item.addr)
@@ -391,15 +451,30 @@ function App() {
             // The data-api caps /trades at 500 per request, so to pull 1,000 we fetch
             // two pages via offset (0 and 500) and combine them. If a page comes back
             // short, there's no more data and we stop early.
-            const PAGE = 500, TARGET = 1000;
+            // The data-api caps /trades at 500 per request, so to pull 2,000 we page
+            // through with offset (0, 500, 1000, 1500). We de-dup by transaction hash
+            // and stop early if a page returns nothing new — that handles both the end
+            // of available trades and the API's offset ceiling on high-activity feeds.
+            const PAGE = 500, TARGET = 2000;
             let raw = [];
+            const seenTx = new Set();
             for (let offset = 0; offset < TARGET; offset += PAGE) {
                 const page = await jFetch(`${DA}/trades?limit=${PAGE}&offset=${offset}&takerOnly=true`);
                 if (!Array.isArray(page) || page.length === 0)
                     break;
-                raw = raw.concat(page);
+                let added = 0;
+                for (const t of page) {
+                    const key = t.transactionHash || `${t.proxyWallet}-${t.conditionId}-${t.timestamp}`;
+                    if (!seenTx.has(key)) {
+                        seenTx.add(key);
+                        raw.push(t);
+                        added++;
+                    }
+                }
                 if (page.length < PAGE)
                     break; // reached the end of available trades
+                if (added === 0)
+                    break; // offset not advancing → stop (no dupes piled up)
             }
             if (!raw.length)
                 throw new Error("No trades returned from data-api.");
@@ -434,6 +509,9 @@ function App() {
             setNewIds(fresh);
             setFeed(deduped);
             setLastUpd(new Date());
+            // Ring the alert bell if this refresh surfaced any flagged trades (silent if none).
+            if (soundOnR.current && deduped.length > 0)
+                playBell();
             setPhase("enrich");
             deduped.slice(0, 4).forEach(t => enrich(t));
             setPhase("done");
@@ -453,7 +531,7 @@ function App() {
     useEffect(() => {
         clearInterval(timerRef.current);
         if (autoRef)
-            timerRef.current = setInterval(scan, 600000); // 10 minutes
+            timerRef.current = setInterval(scan, 300000); // 5 minutes
         return () => clearInterval(timerRef.current);
     }, [autoRef, scan]);
     const sorted = [...feed].sort((a, b) => {
@@ -526,7 +604,11 @@ function App() {
                     React.createElement("div", { style: { display: "flex", gap: 5 } }, [[0, "all"], [5, "5+"], [10, "10+"], [14, "14+"], [18, "18"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMinScore(v), style: { padding: "5px 10px", fontSize: 10, fontFamily: T.mono, background: minScore === v ? "rgba(249,115,22,.14)" : "transparent", border: `1px solid ${minScore === v ? "rgba(249,115,22,.35)" : T.bdr}`, color: minScore === v ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, l))))),
                 React.createElement("div", null,
                     React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "AUTO-REFRESH"),
-                    React.createElement("button", { onClick: () => setAutoRef(p => !p), style: { padding: "5px 12px", fontSize: 10, background: autoRef ? "rgba(74,222,128,.10)" : "transparent", border: `1px solid ${autoRef ? "rgba(74,222,128,.28)" : T.bdr}`, color: autoRef ? T.ok : T.muted, borderRadius: 4, cursor: "pointer" } }, autoRef ? "ON · 10m" : "OFF")),
+                    React.createElement("button", { onClick: () => setAutoRef(p => !p), style: { padding: "5px 12px", fontSize: 10, background: autoRef ? "rgba(74,222,128,.10)" : "transparent", border: `1px solid ${autoRef ? "rgba(74,222,128,.28)" : T.bdr}`, color: autoRef ? T.ok : T.muted, borderRadius: 4, cursor: "pointer" } }, autoRef ? "ON · 5m" : "OFF")),
+                React.createElement("div", null,
+                    React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "ALERT SOUND"),
+                    React.createElement("button", { onClick: () => { unlockAudio(); if (!soundOn)
+                            playBell(); setSoundOn(p => !p); }, style: { padding: "5px 12px", fontSize: 10, background: soundOn ? "rgba(111,205,248,.12)" : "transparent", border: `1px solid ${soundOn ? "rgba(111,205,248,.32)" : T.bdr}`, color: soundOn ? T.a : T.muted, borderRadius: 4, cursor: "pointer" } }, soundOn ? "ON · bell" : "OFF · muted")),
                 React.createElement("div", null,
                     React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "POLITICS / GEO ONLY"),
                     React.createElement("button", { onClick: () => setExcludeNoise(p => !p), style: { padding: "5px 12px", fontSize: 10, background: excludeNoise ? "rgba(249,115,22,.12)" : "transparent", border: `1px solid ${excludeNoise ? "rgba(249,115,22,.32)" : T.bdr}`, color: excludeNoise ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, excludeNoise ? "ON · allowlist" : "OFF · show all")),
