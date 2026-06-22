@@ -1,26 +1,10 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <title>Polymarket Insider Screener</title>
-  <link rel="manifest" href="/manifest.webmanifest" />
-  <meta name="theme-color" content="#07080F" />
-  <link rel="icon" type="image/png" href="/icon-192.png" />
-  <link rel="apple-touch-icon" href="/icon-192.png" />
-  <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="apple-mobile-web-app-title" content="Insider Screener" />
-  <style>
-    html, body, #root { margin: 0; height: 100%; background: #07080F; }
-    #boot { color:#CBD8E6; font-family: system-ui, sans-serif; font-size:13px; display:flex; align-items:center; justify-content:center; height:100vh; }
-  </style>
-  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-</head>
-<body>
-  <div id="root"><div id="boot">Loading screener…</div></div>
-  <script>
+<html lang="en"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" /><title>Polymarket Insider Screener</title>
+<link rel="manifest" href="/manifest.webmanifest" /><meta name="theme-color" content="#07080F" /><link rel="icon" type="image/png" href="/icon-192.png" /><link rel="apple-touch-icon" href="/icon-192.png" /><meta name="apple-mobile-web-app-capable" content="yes" /><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" /><meta name="apple-mobile-web-app-title" content="Insider Screener" />
+<style>html, body, #root { margin: 0; height: 100%; background: #07080F; } #boot { color:#CBD8E6; font-family: system-ui, sans-serif; font-size:13px; display:flex; align-items:center; justify-content:center; height:100vh; }</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script><script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script></head>
+<body><div id="root"><div id="boot">Loading screener…</div></div>
+<script>
 "use strict";
 const { useState, useEffect, useCallback, useRef } = React;
 // ════════════════════════════════════════════════════════════════════════════
@@ -53,15 +37,17 @@ const getR = s => RISK.find(r => s >= r.min) || RISK[4];
 const scoreOdds = p => {
     if (!p || p <= 0)
         return 0;
+    if (p < 5)
+        return 24; // deep longshot — strongest entry signal
     if (p < 10)
-        return 18;
+        return 22;
     if (p < 20)
-        return 14;
+        return 17;
     if (p < 35)
-        return 10;
+        return 11;
     if (p < 50)
-        return 5;
-    return 0;
+        return 6;
+    return 0; // 50%+ entry (betting a favorite) — not an insider pattern
 };
 const scoreTiming = h => {
     if (h === null || h === undefined || h < 0)
@@ -303,7 +289,7 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                     React.createElement("div", { style: { minWidth: 250, flex: 1 } },
                         React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 11 } }, "SIGNAL BREAKDOWN"),
                         React.createElement("div", { style: { fontSize: 8, color: T.s, letterSpacing: 1.5, fontWeight: 700, background: `${T.s}12`, padding: "2px 6px", borderRadius: 3, display: "inline-block", marginBottom: 9 } }, "S-TIER"),
-                        React.createElement(MiniBar, { label: "Entry Odds Level", tier: "S", pts: (_c = item.sig_odds) !== null && _c !== void 0 ? _c : 0, max: 18 }),
+                        React.createElement(MiniBar, { label: "Entry Odds Level", tier: "S", pts: (_c = item.sig_odds) !== null && _c !== void 0 ? _c : 0, max: 24 }),
                         React.createElement(MiniBar, { label: "Pre-Resolution Timing", tier: "S", pts: item.sig_time, max: 22, naText: item.enriched ? "no resolved date" : "enriching…" }),
                         React.createElement(MiniBar, { label: "Privacy Bridge Origin", tier: "S", pts: null, max: 25, naText: "manual \u2193" }),
                         React.createElement("div", { style: { height: 1, background: T.bdr, margin: "9px 0" } }),
@@ -368,7 +354,7 @@ function Steps({ phase }) {
 }
 function App() {
     const [minCash, setMinCash] = useState(1000);
-    const [minScore, setMinScore] = useState(5);
+    const [minScore, setMinScore] = useState(6); // default: entry must be < 50%
     const [autoRef, setAutoRef] = useState(true);
     const [excludeNoise, setExcludeNoise] = useState(true); // politics/geo allowlist on by default
     const [soundOn, setSoundOn] = useState(true); // bell on flagged trades
@@ -422,7 +408,7 @@ function App() {
             const sig_wr = scoreWR(w.wins, w.resolved);
             const sig_dorm = scoreDorm(w.afterWin);
             const parts = [r.sig_odds, sig_time, sig_wr, sig_dorm].filter(x => x !== null && x !== undefined);
-            const maxParts = 18 + (sig_time !== null ? 22 : 0) + 6 + (sig_dorm !== null ? 7 : 0);
+            const maxParts = 24 + (sig_time !== null ? 22 : 0) + 6 + (sig_dorm !== null ? 7 : 0);
             return {
                 ...r, endDate, hours, sig_time, sig_wr, sig_dorm,
                 w_wins: w.wins, w_resolved: w.resolved, w_pnl: w.pnl, w_open: w.open,
@@ -502,12 +488,14 @@ function App() {
                 const sig_odds = scoreOdds(t.price * 100);
                 return {
                     ...t, sig_odds, sig_time: null, sig_wr: null, sig_dorm: null,
-                    hours: null, endDate: null, quickScore: sig_odds, quickMax: 18,
+                    hours: null, endDate: null, quickScore: sig_odds, quickMax: 24,
                     fullScore: null, fullMax: null,
                     w_wins: null, w_resolved: null, w_pnl: null, w_open: null,
                     enriched: false, enriching: false,
                 };
-            }).filter(t => t.sig_odds >= minScoreR.current || minScoreR.current <= 5);
+            }).filter(t => t.sig_odds >= minScoreR.current);
+            // No keep-all fallback: a trade must clear the entry-odds bar to be flagged,
+            // so near-certainty bets (98–99%, which score 0) are excluded by default.
             const seen = new Map();
             scored.forEach(t => {
                 const key = `${t.addr}|${t.conditionId}`;
@@ -613,8 +601,8 @@ function App() {
                     React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "MIN CASH VALUE (price \u00D7 shares)"),
                     React.createElement("div", { style: { display: "flex", gap: 5 } }, [[100, "$100"], [500, "$500"], [1000, "$1K"], [5000, "$5K"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMinCash(v), style: { padding: "5px 10px", fontSize: 10, fontFamily: T.mono, background: minCash === v ? "rgba(56,189,248,.14)" : "transparent", border: `1px solid ${minCash === v ? "rgba(56,189,248,.35)" : T.bdr}`, color: minCash === v ? T.a : T.muted, borderRadius: 4, cursor: "pointer" } }, l))))),
                 React.createElement("div", null,
-                    React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "MIN ENTRY-ODDS SCORE (pre-enrich)"),
-                    React.createElement("div", { style: { display: "flex", gap: 5 } }, [[0, "all"], [5, "5+"], [10, "10+"], [14, "14+"], [18, "18"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMinScore(v), style: { padding: "5px 10px", fontSize: 10, fontFamily: T.mono, background: minScore === v ? "rgba(249,115,22,.14)" : "transparent", border: `1px solid ${minScore === v ? "rgba(249,115,22,.35)" : T.bdr}`, color: minScore === v ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, l))))),
+                    React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "MAX ENTRY ODDS"),
+                    React.createElement("div", { style: { display: "flex", gap: 5 } }, [[0, "all"], [6, "<50%"], [11, "<35%"], [17, "<20%"], [22, "<10%"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMinScore(v), style: { padding: "5px 10px", fontSize: 10, fontFamily: T.mono, background: minScore === v ? "rgba(249,115,22,.14)" : "transparent", border: `1px solid ${minScore === v ? "rgba(249,115,22,.35)" : T.bdr}`, color: minScore === v ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, l))))),
                 React.createElement("div", null,
                     React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "AUTO-REFRESH"),
                     React.createElement("button", { onClick: () => setAutoRef(p => !p), style: { padding: "5px 12px", fontSize: 10, background: autoRef ? "rgba(74,222,128,.10)" : "transparent", border: `1px solid ${autoRef ? "rgba(74,222,128,.28)" : T.bdr}`, color: autoRef ? T.ok : T.muted, borderRadius: 4, cursor: "pointer" } }, autoRef ? "ON · 5m" : "OFF")),
@@ -686,15 +674,10 @@ function App() {
                 React.createElement("div", { style: { padding: "12px 18px", borderTop: `1px solid ${T.bdr}` } },
                     React.createElement("span", { style: { fontSize: 10, color: T.dim, lineHeight: 1.85 } },
                         sorted.length,
-                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201318) \u00B7 Timing/Win-Rate/Dormancy fill in from each wallet's /positions \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
+                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots; 50%+ entries excluded) \u00B7 Timing/Win-Rate/Dormancy fill in from each wallet's /positions \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
 
-  </script>
-  <script>
-    if ("serviceWorker" in navigator) {
-      window.addEventListener("load", function () { navigator.serviceWorker.register("/sw.js").catch(function () {}); });
-    }
-  </script>
-</body>
-</html>
+</script>
+<script>if ("serviceWorker" in navigator) { window.addEventListener("load", function () { navigator.serviceWorker.register("/sw.js").catch(function () {}); }); }</script>
+</body></html>
