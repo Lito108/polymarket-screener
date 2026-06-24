@@ -47,7 +47,9 @@ const scoreOdds = p => {
         return 11;
     if (p < 50)
         return 6;
-    return 0; // 50%+ entry (betting a favorite) — not an insider pattern
+    if (p < 75)
+        return 3; // mild underdog — minor signal
+    return 0; // 75%+ entry (betting a favorite) — not an insider pattern
 };
 const scoreTiming = h => {
     if (h === null || h === undefined || h < 0)
@@ -285,6 +287,25 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                 : React.createElement("span", { style: { color: T.dim, fontSize: 10 } }, "\u2014"))),
         expanded && (React.createElement("tr", { style: { background: `${rk.c}04`, borderBottom: `1px solid ${T.bdr}` } },
             React.createElement("td", { colSpan: 9, style: { padding: "16px 20px 18px" } },
+                React.createElement("div", { style: { marginBottom: 16, paddingBottom: 14, borderBottom: `1px solid ${T.bdr}` } },
+                    React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "MARKET"),
+                    React.createElement("div", { style: { fontSize: 14, color: T.text, lineHeight: 1.5, fontWeight: 600 } }, item.title || `Condition ${item.conditionId}`),
+                    React.createElement("div", { style: { marginTop: 6, display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center" } },
+                        item.outcome && (React.createElement("span", { style: { fontSize: 11, color: T.muted } },
+                            "Bought:",
+                            " ",
+                            React.createElement("span", { style: { fontWeight: 700, fontFamily: T.mono,
+                                    color: item.outcome.toLowerCase() === "yes" ? T.ok : item.outcome.toLowerCase() === "no" ? "#F87171" : T.a } }, item.outcome.toUpperCase()),
+                            React.createElement("span", { style: { color: T.dim } },
+                                " @ ",
+                                (item.price * 100).toFixed(1),
+                                "%"))),
+                        React.createElement("span", { style: { fontSize: 11, color: T.muted } },
+                            "Size: ",
+                            React.createElement("span", { style: { fontFamily: T.mono, color: T.text } },
+                                "$",
+                                item.cash.toLocaleString(undefined, { maximumFractionDigits: 0 }))),
+                        item.slug && (React.createElement("a", { href: `https://polymarket.com/event/${item.slug}`, target: "_blank", rel: "noopener noreferrer", style: { fontSize: 11, color: T.a, textDecoration: "none" } }, "Open on Polymarket \u2197")))),
                 React.createElement("div", { style: { display: "flex", gap: 28, flexWrap: "wrap" } },
                     React.createElement("div", { style: { minWidth: 250, flex: 1 } },
                         React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 11 } }, "SIGNAL BREAKDOWN"),
@@ -602,7 +623,7 @@ function App() {
                     React.createElement("div", { style: { display: "flex", gap: 5 } }, [[100, "$100"], [500, "$500"], [1000, "$1K"], [5000, "$5K"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMinCash(v), style: { padding: "5px 10px", fontSize: 10, fontFamily: T.mono, background: minCash === v ? "rgba(56,189,248,.14)" : "transparent", border: `1px solid ${minCash === v ? "rgba(56,189,248,.35)" : T.bdr}`, color: minCash === v ? T.a : T.muted, borderRadius: 4, cursor: "pointer" } }, l))))),
                 React.createElement("div", null,
                     React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "MAX ENTRY ODDS"),
-                    React.createElement("div", { style: { display: "flex", gap: 5 } }, [[0, "all"], [6, "<50%"], [11, "<35%"], [17, "<20%"], [22, "<10%"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMinScore(v), style: { padding: "5px 10px", fontSize: 10, fontFamily: T.mono, background: minScore === v ? "rgba(249,115,22,.14)" : "transparent", border: `1px solid ${minScore === v ? "rgba(249,115,22,.35)" : T.bdr}`, color: minScore === v ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, l))))),
+                    React.createElement("div", { style: { display: "flex", gap: 5 } }, [[0, "all"], [3, "<75%"], [6, "<50%"], [11, "<35%"], [17, "<20%"], [22, "<10%"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMinScore(v), style: { padding: "5px 10px", fontSize: 10, fontFamily: T.mono, background: minScore === v ? "rgba(249,115,22,.14)" : "transparent", border: `1px solid ${minScore === v ? "rgba(249,115,22,.35)" : T.bdr}`, color: minScore === v ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, l))))),
                 React.createElement("div", null,
                     React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "AUTO-REFRESH"),
                     React.createElement("button", { onClick: () => setAutoRef(p => !p), style: { padding: "5px 12px", fontSize: 10, background: autoRef ? "rgba(74,222,128,.10)" : "transparent", border: `1px solid ${autoRef ? "rgba(74,222,128,.28)" : T.bdr}`, color: autoRef ? T.ok : T.muted, borderRadius: 4, cursor: "pointer" } }, autoRef ? "ON · 5m" : "OFF")),
@@ -674,7 +695,7 @@ function App() {
                 React.createElement("div", { style: { padding: "12px 18px", borderTop: `1px solid ${T.bdr}` } },
                     React.createElement("span", { style: { fontSize: 10, color: T.dim, lineHeight: 1.85 } },
                         sorted.length,
-                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots; 50%+ entries excluded) \u00B7 Timing/Win-Rate/Dormancy fill in from each wallet's /positions \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
+                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots; 50%+ entries excluded by default) \u00B7 Timing/Win-Rate/Dormancy fill in from each wallet's /positions \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
 
