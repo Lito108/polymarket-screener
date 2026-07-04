@@ -1,14 +1,21 @@
-# Netlify config for the standalone (no-build) screener + relay.
-# There is no build step: index.html runs as-is. Netlify just publishes the
-# folder and deploys the function.
+# Netlify config for the standalone (no-build) screener + backend.
+# index.html runs as-is; Netlify installs package.json deps for the functions,
+# deploys them, and runs collector.mjs on its built-in schedule.
 
 [build]
   publish = "."
   functions = "netlify/functions"
 
-# Clean URL:  /api/poly  ->  the relay function.
+# Clean URL:  /api/poly  ->  the CORS relay (legacy backup, unused by default).
 [[redirects]]
   from = "/api/poly"
   to = "/.netlify/functions/poly"
+  status = 200
+  force = true
+
+# Clean URL:  /api/trades  ->  the history database reader.
+[[redirects]]
+  from = "/api/trades"
+  to = "/.netlify/functions/trades-api"
   status = 200
   force = true

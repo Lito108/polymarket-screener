@@ -51,6 +51,22 @@ const scoreOdds = p => {
         return 3; // mild underdog — minor signal
     return 0; // 75%+ entry (betting a favorite) — not an insider pattern
 };
+// ── Entry-odds bands ───────────────────────────────────────────────────────────
+// Which entry-odds ranges are shown. "both" (default) = deep longshots (<10%,
+// the classic insider signature) PLUS the 60–75% zone (informed money buying a
+// likely-but-unconfirmed outcome just before news). The 10–60% middle — where
+// genuine uncertainty and opinion-trading dominate — is hidden by default.
+const inOddsBand = (pct, band) => {
+    if (!(pct > 0))
+        return false;
+    if (band === "low")
+        return pct < 10;
+    if (band === "mid")
+        return pct >= 60 && pct < 75;
+    if (band === "all")
+        return pct < 75;
+    return pct < 10 || (pct >= 60 && pct < 75); // "both" (default)
+};
 const scoreTiming = h => {
     if (h === null || h === undefined || h < 0)
         return null;
@@ -305,6 +321,9 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                             React.createElement("span", { style: { fontFamily: T.mono, color: T.text } },
                                 "$",
                                 item.cash.toLocaleString(undefined, { maximumFractionDigits: 0 }))),
+                        item.ts && (React.createElement("span", { style: { fontSize: 11, color: T.muted } },
+                            "Traded: ",
+                            React.createElement("span", { style: { fontFamily: T.mono, color: T.text } }, item.ts.toLocaleString()))),
                         item.slug && (React.createElement("a", { href: `https://polymarket.com/event/${item.slug}`, target: "_blank", rel: "noopener noreferrer", style: { fontSize: 11, color: T.a, textDecoration: "none" } }, "Open on Polymarket \u2197")))),
                 React.createElement("div", { style: { display: "flex", gap: 28, flexWrap: "wrap" } },
                     React.createElement("div", { style: { minWidth: 250, flex: 1 } },
@@ -374,11 +393,15 @@ function Steps({ phase }) {
         React.createElement("span", { style: { fontSize: 11, color: i < idx ? T.ok : i === idx ? T.text : T.dim } }, label))))));
 }
 function App() {
-    const [minCash, setMinCash] = useState(1000);
-    const [minScore, setMinScore] = useState(6); // default: entry must be < 50%
+    const [minCash, setMinCash] = useState(500); // default: cash ≥ $500
+    const [oddsBand, setOddsBand] = useState("both"); // default: <10% + 60–75%
+    const [resolve30, setResolve30] = useState(true); // only markets resolving within 30 days
     const [autoRef, setAutoRef] = useState(true);
     const [excludeNoise, setExcludeNoise] = useState(true); // politics/geo allowlist on by default
     const [soundOn, setSoundOn] = useState(true); // bell on flagged trades
+    const [mode, setMode] = useState("live"); // "live" snapshot | "history" database
+    const [histDays, setHistDays] = useState(3); // history window (days)
+    const [dbMeta, setDbMeta] = useState(null); // collector status from /api/trades
     const [showCtrl, setShowCtrl] = useState(false);
     const [sortBy, setSortBy] = useState("score");
     const [feed, setFeed] = useState([]);
@@ -394,12 +417,18 @@ function App() {
     const timerRef = useRef(null);
     const scanningR = useRef(false);
     const minCashR = useRef(minCash);
-    const minScoreR = useRef(minScore);
+    const oddsBandR = useRef(oddsBand);
+    const resolve30R = useRef(resolve30);
     const politicsOnlyR = useRef(excludeNoise);
     useEffect(() => { minCashR.current = minCash; }, [minCash]);
-    useEffect(() => { minScoreR.current = minScore; }, [minScore]);
+    useEffect(() => { oddsBandR.current = oddsBand; }, [oddsBand]);
+    useEffect(() => { resolve30R.current = resolve30; }, [resolve30]);
     useEffect(() => { politicsOnlyR.current = excludeNoise; }, [excludeNoise]);
     const soundOnR = useRef(soundOn);
+    const modeR = useRef(mode);
+    const histDaysR = useRef(histDays);
+    const prevModeR = useRef("live");
+    useEffect(() => { histDaysR.current = histDays; }, [histDays]);
     useEffect(() => { soundOnR.current = soundOn; }, [soundOn]);
     // Unlock audio on the first user interaction (browser autoplay policy).
     useEffect(() => {
@@ -461,6 +490,30 @@ function App() {
             setFeed(prev => prev.map(r => r.id === item.id ? { ...r, enriching: false, enriched: false } : r));
         }
     }, []);
+    // Chunked enrich of every flagged row. posCache makes repeat wallets free,
+    // so only NEW wallets cost a /positions call.
+    const enrichAll = useCallback(async (items) => {
+        const CHUNK = 6;
+        for (let i = 0; i < items.length; i += CHUNK) {
+            await Promise.allSettled(items.slice(i, i + CHUNK).map(t => enrich(t)));
+        }
+    }, [enrich]);
+    // Does this trade's market resolve within the next 30 days (from NOW)?
+    // Unknown end-dates fail OPEN (kept visible) so data gaps can't hide candidates.
+    const inWindowNow = (t) => {
+        if (!resolve30R.current)
+            return true;
+        let ed = t.endDate;
+        if (!ed) {
+            const w = posCache.current[t.addr];
+            const p = w && w.byCondition[t.conditionId];
+            ed = p && p.endDate ? p.endDate : null;
+        }
+        if (!ed)
+            return true;
+        const ms = ed.getTime() - Date.now();
+        return ms > 0 && ms <= 2592000000;
+    };
     const scan = useCallback(async () => {
         if (scanningR.current)
             return;
@@ -514,7 +567,7 @@ function App() {
                     w_wins: null, w_resolved: null, w_pnl: null, w_open: null,
                     enriched: false, enriching: false,
                 };
-            }).filter(t => t.sig_odds >= minScoreR.current);
+            }).filter(t => inOddsBand(t.price * 100, oddsBandR.current));
             // No keep-all fallback: a trade must clear the entry-odds bar to be flagged,
             // so near-certainty bets (98–99%, which score 0) are excluded by default.
             const seen = new Map();
@@ -531,11 +584,14 @@ function App() {
             setNewIds(fresh);
             setFeed(deduped);
             setLastUpd(new Date());
-            // Ring the alert bell if this refresh surfaced any flagged trades (silent if none).
-            if (soundOnR.current && deduped.length > 0)
-                playBell();
+            prevModeR.current = "live";
+            // Enrich EVERY flagged row (chunked; wallet cache dedups) so the
+            // resolution-window filter has an endDate for each market.
             setPhase("enrich");
-            deduped.slice(0, 4).forEach(t => enrich(t));
+            await enrichAll(deduped);
+            // Bell only for trades that SURVIVE the resolution window (silent if none).
+            if (soundOnR.current && deduped.some(t => inWindowNow(t)))
+                playBell();
             setPhase("done");
         }
         catch (e) {
@@ -548,15 +604,97 @@ function App() {
             setPhase("err");
         }
         scanningR.current = false;
-    }, [enrich]);
-    useEffect(() => { scan(); }, []); // eslint-disable-line
+    }, [enrich, enrichAll]);
+    // ── History scan: read from OUR database (collector → Netlify Blobs) ────────
+    const scanHistory = useCallback(async () => {
+        if (scanningR.current)
+            return;
+        scanningR.current = true;
+        setErrMsg("");
+        setPhase("trades");
+        try {
+            const r = await fetch(`/api/trades?days=${histDaysR.current}`, { headers: { Accept: "application/json" } });
+            if (!r.ok)
+                throw new Error(`History API HTTP ${r.status} — has the collector deployed and run yet?`);
+            const data = await r.json();
+            setDbMeta(data.meta || null);
+            const recs = Array.isArray(data.trades) ? data.trades : [];
+            setPhase("scoring");
+            // Stored records are already politics-only, ≥$500, <75% (collector filters).
+            // UI filters can still tighten further (higher min cash / lower max odds).
+            const trades = recs.map(q => ({
+                id: q.id, addr: q.addr || "", conditionId: q.conditionId || "",
+                ts: q.ts ? new Date(q.ts * 1000) : null,
+                price: q.price || 0, shares: q.shares || 0, cash: q.cash || 0,
+                side: "BUY", outcome: q.outcome || "", title: q.title || "", slug: q.slug || "",
+            })).filter(t => t.addr && t.conditionId && t.cash >= minCashR.current);
+            setFetched(recs.length);
+            setExcluded(0);
+            const scored = trades.map(t => {
+                const sig_odds = scoreOdds(t.price * 100);
+                return {
+                    ...t, sig_odds, sig_time: null, sig_wr: null, sig_dorm: null,
+                    hours: null, endDate: null, quickScore: sig_odds, quickMax: 24,
+                    fullScore: null, fullMax: null,
+                    w_wins: null, w_resolved: null, w_pnl: null, w_open: null,
+                    enriched: false, enriching: false,
+                };
+            }).filter(t => inOddsBand(t.price * 100, oddsBandR.current));
+            const seen = new Map();
+            scored.forEach(t => {
+                const key = `${t.addr}|${t.conditionId}`;
+                if (!seen.has(key) || t.sig_odds > seen.get(key).sig_odds)
+                    seen.set(key, t);
+            });
+            const deduped = [...seen.values()]
+                .sort((a, b) => b.cash - a.cash)
+                .sort((a, b) => b.sig_odds - a.sig_odds);
+            const fresh = new Set(deduped.filter(t => !prevIds.current.has(t.id)).map(t => t.id));
+            const switched = prevModeR.current !== "history";
+            prevModeR.current = "history";
+            prevIds.current = new Set(deduped.map(t => t.id));
+            setNewIds(switched ? new Set() : fresh);
+            setFeed(deduped);
+            setLastUpd(new Date());
+            setPhase("enrich");
+            await enrichAll(deduped);
+            // History bell: only for NEW arrivals that survive the resolution window
+            // (not on first load / mode switch — history always has rows).
+            if (soundOnR.current && !switched && deduped.some(t => fresh.has(t.id) && inWindowNow(t)))
+                playBell();
+            setPhase("done");
+        }
+        catch (e) {
+            setErrMsg(e.message || "History scan failed.");
+            setPhase("err");
+        }
+        scanningR.current = false;
+    }, [enrich, enrichAll]);
+    // Dispatcher: SCAN NOW, auto-refresh, and mode switches all route through here.
+    const runScan = useCallback(() => {
+        return modeR.current === "history" ? scanHistory() : scan();
+    }, [scan, scanHistory]);
+    // Rescan when the mode or the history window changes.
+    useEffect(() => { modeR.current = mode; runScan(); }, [mode]); // eslint-disable-line
+    useEffect(() => { if (modeR.current === "history")
+        runScan(); }, [histDays]); // eslint-disable-line
     useEffect(() => {
         clearInterval(timerRef.current);
         if (autoRef)
-            timerRef.current = setInterval(scan, 300000); // 5 minutes
+            timerRef.current = setInterval(runScan, 300000); // 5 minutes
         return () => clearInterval(timerRef.current);
-    }, [autoRef, scan]);
-    const sorted = [...feed].sort((a, b) => {
+    }, [autoRef, runScan]);
+    // Resolution-window filter (display-time): hide markets resolving >30d out,
+    // or already resolved; unknown dates stay visible.
+    const visible = feed.filter(t => {
+        if (!resolve30)
+            return true;
+        if (!t.endDate)
+            return true;
+        const ms = t.endDate.getTime() - Date.now();
+        return ms > 0 && ms <= 2592000000;
+    });
+    const sorted = [...visible].sort((a, b) => {
         var _a, _b, _c, _d;
         const as = (_a = a.fullScore) !== null && _a !== void 0 ? _a : a.quickScore;
         const bs = (_b = b.fullScore) !== null && _b !== void 0 ? _b : b.quickScore;
@@ -584,8 +722,8 @@ function App() {
             return next;
         });
     };
-    const critCount = feed.filter(t => { var _a; return ((_a = t.fullScore) !== null && _a !== void 0 ? _a : t.quickScore) >= 60; }).length;
-    const highCount = feed.filter(t => { var _a; return ((_a = t.fullScore) !== null && _a !== void 0 ? _a : t.quickScore) >= 40; }).length;
+    const critCount = visible.filter(t => { var _a; return ((_a = t.fullScore) !== null && _a !== void 0 ? _a : t.quickScore) >= 60; }).length;
+    const highCount = visible.filter(t => { var _a; return ((_a = t.fullScore) !== null && _a !== void 0 ? _a : t.quickScore) >= 40; }).length;
     return (React.createElement("div", { style: { background: T.bg, minHeight: "100vh", color: T.text, fontFamily: "'Inter', system-ui, sans-serif", fontSize: 13 } },
         React.createElement("style", null, `
         @keyframes ping  { 0%,100%{opacity:.2;transform:scale(1)} 60%{opacity:.5;transform:scale(2.4)} }
@@ -612,18 +750,26 @@ function App() {
                             React.createElement("span", { style: { fontSize: 8, color: "#FF7A7A", fontFamily: T.mono } },
                                 critCount,
                                 " HIGH/CRIT")))),
-                    React.createElement("div", { style: { fontSize: 11, color: T.dim } }, "data-api \u00B7 politics/geo allowlist (sports, crypto, meme markets hidden) \u00B7 cash = price\u00D7size \u00B7 timing from positions")),
+                    React.createElement("div", { style: { fontSize: 11, color: T.dim } }, "data-api \u00B7 politics/geo allowlist \u00B7 LIVE snapshot + HISTORY database (30-day) \u00B7 cash = price\u00D7size")),
                 React.createElement("div", { style: { display: "flex", gap: 8, alignItems: "center" } },
+                    React.createElement("div", { style: { display: "flex", border: `1px solid ${T.bdr}`, borderRadius: 5, overflow: "hidden" } }, [["live", "LIVE"], ["history", "HISTORY"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMode(v), style: {
+                            padding: "7px 13px", fontSize: 10, fontWeight: 700, letterSpacing: 1,
+                            background: mode === v ? "rgba(111,205,248,.14)" : "transparent",
+                            border: "none", color: mode === v ? T.a : T.muted, cursor: "pointer",
+                        } }, l)))),
                     React.createElement("button", { onClick: () => setShowCtrl(p => !p), style: { background: "transparent", border: `1px solid ${showCtrl ? "rgba(56,189,248,.3)" : T.bdr}`, color: showCtrl ? T.a : T.muted, padding: "7px 12px", borderRadius: 5, cursor: "pointer", fontSize: 11 } }, "\u2699 Filters"),
-                    React.createElement("button", { onClick: scan, disabled: scanning, style: { background: scanning ? "transparent" : "rgba(56,189,248,.10)", border: "1px solid rgba(56,189,248,.28)", color: T.a, padding: "7px 16px", borderRadius: 5, cursor: scanning ? "default" : "pointer", fontSize: 11, fontWeight: 700, letterSpacing: .5, opacity: scanning ? .4 : 1 } }, scanning ? "SCANNING…" : "↻ SCAN NOW")))),
+                    React.createElement("button", { onClick: runScan, disabled: scanning, style: { background: scanning ? "transparent" : "rgba(56,189,248,.10)", border: "1px solid rgba(56,189,248,.28)", color: T.a, padding: "7px 16px", borderRadius: 5, cursor: scanning ? "default" : "pointer", fontSize: 11, fontWeight: 700, letterSpacing: .5, opacity: scanning ? .4 : 1 } }, scanning ? "SCANNING…" : "↻ SCAN NOW")))),
         showCtrl && (React.createElement("div", { style: { borderBottom: `1px solid ${T.bdr}`, padding: "12px 18px", background: "rgba(12,17,32,.9)" } },
             React.createElement("div", { style: { maxWidth: 1240, margin: "0 auto", display: "flex", gap: 24, flexWrap: "wrap", alignItems: "flex-end" } },
                 React.createElement("div", null,
                     React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "MIN CASH VALUE (price \u00D7 shares)"),
                     React.createElement("div", { style: { display: "flex", gap: 5 } }, [[100, "$100"], [500, "$500"], [1000, "$1K"], [5000, "$5K"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMinCash(v), style: { padding: "5px 10px", fontSize: 10, fontFamily: T.mono, background: minCash === v ? "rgba(56,189,248,.14)" : "transparent", border: `1px solid ${minCash === v ? "rgba(56,189,248,.35)" : T.bdr}`, color: minCash === v ? T.a : T.muted, borderRadius: 4, cursor: "pointer" } }, l))))),
                 React.createElement("div", null,
-                    React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "MAX ENTRY ODDS"),
-                    React.createElement("div", { style: { display: "flex", gap: 5 } }, [[0, "all"], [3, "<75%"], [6, "<50%"], [11, "<35%"], [17, "<20%"], [22, "<10%"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMinScore(v), style: { padding: "5px 10px", fontSize: 10, fontFamily: T.mono, background: minScore === v ? "rgba(249,115,22,.14)" : "transparent", border: `1px solid ${minScore === v ? "rgba(249,115,22,.35)" : T.bdr}`, color: minScore === v ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, l))))),
+                    React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "ENTRY ODDS BANDS"),
+                    React.createElement("div", { style: { display: "flex", gap: 5 } }, [["both", "<10% + 60\u201375%"], ["low", "<10% only"], ["mid", "60\u201375% only"], ["all", "all <75%"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setOddsBand(v), style: { padding: "5px 10px", fontSize: 10, fontFamily: T.mono, background: oddsBand === v ? "rgba(249,115,22,.14)" : "transparent", border: `1px solid ${oddsBand === v ? "rgba(249,115,22,.35)" : T.bdr}`, color: oddsBand === v ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, l))))),
+                React.createElement("div", null,
+                    React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "RESOLUTION WINDOW"),
+                    React.createElement("button", { onClick: () => setResolve30(p => !p), style: { padding: "5px 12px", fontSize: 10, fontFamily: T.mono, background: resolve30 ? "rgba(249,115,22,.12)" : "transparent", border: `1px solid ${resolve30 ? "rgba(249,115,22,.32)" : T.bdr}`, color: resolve30 ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, resolve30 ? "ON · <30 days" : "OFF · any")),
                 React.createElement("div", null,
                     React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "AUTO-REFRESH"),
                     React.createElement("button", { onClick: () => setAutoRef(p => !p), style: { padding: "5px 12px", fontSize: 10, background: autoRef ? "rgba(74,222,128,.10)" : "transparent", border: `1px solid ${autoRef ? "rgba(74,222,128,.28)" : T.bdr}`, color: autoRef ? T.ok : T.muted, borderRadius: 4, cursor: "pointer" } }, autoRef ? "ON · 5m" : "OFF")),
@@ -634,13 +780,14 @@ function App() {
                 React.createElement("div", null,
                     React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "POLITICS / GEO ONLY"),
                     React.createElement("button", { onClick: () => setExcludeNoise(p => !p), style: { padding: "5px 12px", fontSize: 10, background: excludeNoise ? "rgba(249,115,22,.12)" : "transparent", border: `1px solid ${excludeNoise ? "rgba(249,115,22,.32)" : T.bdr}`, color: excludeNoise ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, excludeNoise ? "ON · allowlist" : "OFF · show all")),
-                React.createElement("div", { style: { fontSize: 10, color: T.dim, lineHeight: 1.7, marginLeft: "auto", maxWidth: 290 } }, "POLITICS/GEO ONLY surfaces only markets where insider info is possible: elections, appointments, resignations, sanctions, ceasefires, nuclear, courts/SEC/FDA/FBI, Fed/inflation. Sports, crypto, weather & meme markets are hidden. Flip OFF to see everything.")))),
+                React.createElement("div", { style: { fontSize: 10, color: T.dim, lineHeight: 1.7, marginLeft: "auto", maxWidth: 290 } }, "POLITICS/GEO ONLY surfaces only markets where insider info is possible: elections, appointments, resignations, sanctions, ceasefires, nuclear, courts/SEC/FDA/FBI, Fed/inflation. Sports, crypto, weather & meme markets are hidden. Flip OFF to see everything (LIVE mode only). HISTORY reads your own database: politics \u00B7 \u2265$500 \u00B7 <75% collected every 5 min.")))),
         React.createElement("div", { style: { borderBottom: `1px solid ${T.bdr}`, padding: "7px 18px" } },
             React.createElement("div", { style: { maxWidth: 1240, margin: "0 auto", display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap" } },
                 [
                     ["Trades pulled", fetched || (scanning ? "…" : "0")],
                     ["Off-topic cut", excludeNoise ? excluded : "off"],
-                    ["Flagged", feed.length || (scanning ? "…" : "0")],
+                    ["Flagged", visible.length || (scanning ? "…" : "0")],
+                    [">30d cut", resolve30 ? Math.max(0, feed.length - visible.length) : "off"],
                     ["HIGH+", highCount],
                     ["Enriched", feed.filter(t => t.enriched).length],
                     ["Min cash", `$${minCash.toLocaleString()}`],
@@ -653,6 +800,19 @@ function App() {
                 scanning && (React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", marginLeft: 4 } },
                     React.createElement("div", { style: { width: 7, height: 7, border: `1.5px solid ${T.bdr}`, borderTop: `1.5px solid ${T.a}`, borderRadius: "50%", animation: "spin .7s linear infinite" } }),
                     React.createElement("span", { style: { fontSize: 9, color: T.a, letterSpacing: 1 } }, phase))),
+                mode === "history" && (React.createElement("div", { style: { display: "flex", gap: 5, alignItems: "center" } },
+                    React.createElement("span", { style: { fontSize: 9, color: T.dim } }, "Window:"),
+                    [[1, "1d"], [3, "3d"], [7, "7d"], [14, "14d"], [30, "30d"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setHistDays(v), style: {
+                            padding: "2px 8px", fontSize: 9,
+                            background: histDays === v ? "rgba(111,205,248,.10)" : "transparent",
+                            border: `1px solid ${histDays === v ? "rgba(111,205,248,.25)" : T.bdr}`,
+                            color: histDays === v ? T.a : T.dim, borderRadius: 3, cursor: "pointer",
+                        } }, l))),
+                    dbMeta && dbMeta.lastRun && (React.createElement("span", { style: { fontSize: 9, color: T.dim, marginLeft: 6 } },
+                        "DB updated ",
+                        Math.max(0, Math.round((Date.now() - new Date(dbMeta.lastRun).getTime()) / 60000)),
+                        "m ago")),
+                    dbMeta && dbMeta.error && (React.createElement("span", { style: { fontSize: 9, color: "#FF7A7A", marginLeft: 6 } }, "collector error \u2014 see /api/trades")))),
                 React.createElement("div", { style: { marginLeft: "auto", display: "flex", gap: 5, alignItems: "center" } },
                     React.createElement("span", { style: { fontSize: 9, color: T.dim } }, "Sort:"),
                     [["score", "Score"], ["size", "Cash"], ["odds", "Odds %"], ["time", "Timing"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setSortBy(v), style: { padding: "2px 8px", fontSize: 9, background: sortBy === v ? "rgba(56,189,248,.10)" : "transparent", border: `1px solid ${sortBy === v ? "rgba(56,189,248,.25)" : T.bdr}`, color: sortBy === v ? T.a : T.dim, borderRadius: 3, cursor: "pointer" } }, l)))))),
@@ -665,15 +825,15 @@ function App() {
                 React.createElement("div", { style: { width: 44, height: 44, margin: "0 auto 18px", border: `3px solid ${T.bdr}`, borderTop: `3px solid ${T.a}`, borderRadius: "50%", animation: "spin .8s linear infinite" } }),
                 React.createElement("div", { style: { fontSize: 12, color: T.a, fontFamily: T.mono, letterSpacing: 2, marginBottom: 14 } }, "SCANNING POLYMARKET"),
                 React.createElement(Steps, { phase: phase }))),
-            !scanning && feed.length === 0 && phase === "done" && (React.createElement("div", { style: { textAlign: "center", padding: "60px 16px" } },
+            !scanning && sorted.length === 0 && phase === "done" && (React.createElement("div", { style: { textAlign: "center", padding: "60px 16px" } },
                 React.createElement("div", { style: { fontSize: 28, marginBottom: 12 } }, "\u2713"),
                 React.createElement("div", { style: { fontSize: 13, color: T.ok, marginBottom: 8 } }, "No flagged trades this scan"),
                 React.createElement("div", { style: { fontSize: 11, color: T.dim, lineHeight: 1.8 } },
                     fetched,
                     " trades pulled \u00B7 none \u2265 $",
                     minCash.toLocaleString(),
-                    " cash with odds score \u2265 ",
-                    minScore,
+                    " cash inside the selected odds bands",
+                    resolve30 ? " resolving within 30 days" : "",
                     ".",
                     React.createElement("br", null),
                     "Lower the filters or wait for the next refresh."))),
@@ -695,7 +855,7 @@ function App() {
                 React.createElement("div", { style: { padding: "12px 18px", borderTop: `1px solid ${T.bdr}` } },
                     React.createElement("span", { style: { fontSize: 10, color: T.dim, lineHeight: 1.85 } },
                         sorted.length,
-                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots; 50%+ entries excluded by default) \u00B7 Timing/Win-Rate/Dormancy fill in from each wallet's /positions \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
+                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots) \u00B7 shown bands default to <10% and 60\u201375% (10\u201360% and 75%+ hidden) \u00B7 Timing/Win-Rate/Dormancy fill in from each wallet's /positions \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Resolution window hides markets resolving >30 days out or already resolved (unknown dates stay) \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
 
