@@ -1,6 +1,6 @@
 // netlify/functions/collector.mjs
 //
-// The always-on collector. Netlify runs this on a schedule (every 5 minutes,
+// The always-on collector. Netlify runs this on a schedule (every 1 minute,
 // see `config` at the bottom) even when nobody has the screener open. Each run:
 //   1. pulls the most recent trades from Polymarket's data-api,
 //   2. keeps only trades matching the screener's insider-relevant defaults:
@@ -15,7 +15,8 @@
 import { getStore } from "@netlify/blobs";
 
 const DA = "https://data-api.polymarket.com";
-const MIN_CASH = 500;      // dollars (price × shares)
+const STORE_MIN_CASH = 100; // dollars — low floor so split fills survive for aggregation
+                            // (the UI sums fills per wallet×market, then applies YOUR $500+ gate)
 const MAX_PRICE = 0.75;    // exclusive — entry odds must be BELOW 75%
 const PAGE = 500;          // data-api caps /trades at 500 per request
 const TARGET = 2000;       // pages: offsets 0 / 500 / 1000 / 1500 (API ceiling ~1.5k; loop stops early when hit)
@@ -62,6 +63,15 @@ export default async () => {
       if (page.length < PAGE || fresh === 0) break;
     }
     fetched = raw.length;
+    // Coverage telemetry: how many seconds of trading did this fetch actually
+    // span? If spanSec < the run interval (60s), the net has no gaps. If it is
+    // much larger, we saw further back than one interval (fine). If a run ever
+    // fetches a window SHORTER than the gap between runs, trades were missed.
+    let spanSec = 0, oldestTs = 0, newestTs = 0;
+    if (raw.length) {
+      const times = raw.map(r => Number(r.timestamp) || 0).filter(Boolean);
+      if (times.length) { oldestTs = Math.min(...times); newestTs = Math.max(...times); spanSec = newestTs - oldestTs; }
+    }
 
     // 2) Filter to qualifying insider-relevant trades
     const qual = [];
@@ -71,7 +81,7 @@ export default async () => {
       const cash = price * shares;
       if ((r.side || "").toUpperCase() !== "BUY") continue;
       if (!r.proxyWallet || !r.conditionId) continue;
-      if (cash < MIN_CASH) continue;
+      if (cash < STORE_MIN_CASH) continue;
       if (!(price > 0 && price < MAX_PRICE)) continue;
       if (!isRelevant(r.title || "")) continue;
       qual.push({
@@ -127,6 +137,10 @@ export default async () => {
       kept,
       added,
       error,
+      spanSec,           // seconds of trading covered by this fetch
+      oldestTs, newestTs,
+      intervalSec: 60,   // collector cadence; spanSec should exceed this
+      coverageOk: spanSec >= 60 || fetched === 0,
       totalRuns: (prev.totalRuns || 0) + 1,
     });
   } catch { /* non-fatal */ }
@@ -138,4 +152,4 @@ export default async () => {
 
 // Netlify reads this and runs the function on the cron schedule below —
 // every 5 minutes, around the clock, with no browser involved.
-export const config = { schedule: "*/5 * * * *" };
+export const config = { schedule: "* * * * *" };  // every minute (~43k/mo of 125k free)
