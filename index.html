@@ -67,6 +67,41 @@ const inOddsBand = (pct, band) => {
         return pct < 75;
     return pct < 10 || (pct >= 60 && pct < 75); // "both" (default)
 };
+// ── Position aggregation ───────────────────────────────────────────────────────
+// Insiders/whales routinely SPLIT one position into many small fills to stay
+// under size radars. Scoring each fill alone both understates size and lets
+// sub-threshold fills vanish entirely. So we aggregate all fills by the same
+// wallet on the same market+outcome into ONE position: summed cash, share-
+// weighted average entry price, fill count, and earliest timestamp. The
+// min-cash gate is then applied to the AGGREGATE, catching split accumulation.
+function aggregatePositions(trades) {
+    const groups = new Map();
+    for (const t of trades) {
+        const key = `${t.addr}|${t.conditionId}|${(t.outcome || "").toLowerCase()}`;
+        let g = groups.get(key);
+        if (!g) {
+            g = { ...t, cash: 0, shares: 0, fills: 0, _pv: 0, firstTs: t.ts, lastTs: t.ts };
+            groups.set(key, g);
+        }
+        g.cash += t.cash;
+        g.shares += t.shares;
+        g._pv += t.price * t.shares; // price·shares, for weighted average
+        g.fills += 1;
+        if (t.ts && (!g.firstTs || t.ts < g.firstTs))
+            g.firstTs = t.ts;
+        if (t.ts && (!g.lastTs || t.ts > g.lastTs))
+            g.lastTs = t.ts;
+    }
+    const out = [];
+    for (const g of groups.values()) {
+        g.price = g.shares > 0 ? g._pv / g.shares : g.price; // share-weighted avg entry
+        g.ts = g.firstTs; // first entry = timing anchor
+        g.id = `${g.addr}|${g.conditionId}|${(g.outcome || "").toLowerCase()}`;
+        delete g._pv;
+        out.push(g);
+    }
+    return out;
+}
 const scoreTiming = h => {
     if (h === null || h === undefined || h < 0)
         return null;
@@ -294,7 +329,10 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
             React.createElement("td", { style: { padding: "10px 8px" } },
                 React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, color: T.text } },
                     "$",
-                    item.cash.toLocaleString(undefined, { maximumFractionDigits: 0 }))),
+                    item.cash.toLocaleString(undefined, { maximumFractionDigits: 0 })),
+                item.fills > 1 && (React.createElement("span", { style: { fontSize: 8, color: T.s, marginLeft: 4 }, title: `${item.fills} fills aggregated` },
+                    "\u00D7",
+                    item.fills))),
             React.createElement("td", { style: { padding: "10px 8px" } },
                 React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, color: hrsColor } }, hrsFmt)),
             React.createElement("td", { style: { padding: "10px 12px 10px 8px" } }, item.outcome
@@ -320,7 +358,11 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                             "Size: ",
                             React.createElement("span", { style: { fontFamily: T.mono, color: T.text } },
                                 "$",
-                                item.cash.toLocaleString(undefined, { maximumFractionDigits: 0 }))),
+                                item.cash.toLocaleString(undefined, { maximumFractionDigits: 0 })),
+                            item.fills > 1 && (React.createElement("span", { style: { color: T.s } },
+                                " \u00B7 ",
+                                item.fills,
+                                " fills (avg entry, split accumulation)"))),
                         item.ts && (React.createElement("span", { style: { fontSize: 11, color: T.muted } },
                             "Traded: ",
                             React.createElement("span", { style: { fontFamily: T.mono, color: T.text } }, item.ts.toLocaleString()))),
@@ -552,13 +594,15 @@ function App() {
             if (!raw.length)
                 throw new Error("No trades returned from data-api.");
             setPhase("scoring");
-            const buys = raw.map(parseTrade).filter(t => t.side === "BUY" && t.addr && t.conditionId && t.cash >= minCashR.current);
-            // Allowlist: keep only politics/geopolitics/legal/macro markets (by title).
+            // Parse all qualifying BUY fills (NO cash gate yet — we gate the aggregate).
+            const buys = raw.map(parseTrade).filter(t => t.side === "BUY" && t.addr && t.conditionId && t.cash > 0);
             const kept = politicsOnlyR.current ? buys.filter(t => isRelevant(t.title)) : buys;
             setExcluded(buys.length - kept.length);
-            const trades = kept;
             setFetched(raw.length);
-            const scored = trades.map(t => {
+            // Aggregate split fills into positions, THEN apply the min-cash gate so a
+            // whale accumulating in small tranches is caught by summed size.
+            const positions = aggregatePositions(kept).filter(p => p.cash >= minCashR.current);
+            const scored = positions.map(t => {
                 const sig_odds = scoreOdds(t.price * 100);
                 return {
                     ...t, sig_odds, sig_time: null, sig_wr: null, sig_dorm: null,
@@ -568,15 +612,8 @@ function App() {
                     enriched: false, enriching: false,
                 };
             }).filter(t => inOddsBand(t.price * 100, oddsBandR.current));
-            // No keep-all fallback: a trade must clear the entry-odds bar to be flagged,
-            // so near-certainty bets (98–99%, which score 0) are excluded by default.
-            const seen = new Map();
-            scored.forEach(t => {
-                const key = `${t.addr}|${t.conditionId}`;
-                if (!seen.has(key) || t.sig_odds > seen.get(key).sig_odds)
-                    seen.set(key, t);
-            });
-            const deduped = [...seen.values()]
+            // Positions are already unique per wallet×market×outcome; just sort.
+            const deduped = [...scored]
                 .sort((a, b) => b.cash - a.cash)
                 .sort((a, b) => b.sig_odds - a.sig_odds);
             const fresh = new Set(deduped.filter(t => !prevIds.current.has(t.id)).map(t => t.id));
@@ -627,10 +664,12 @@ function App() {
                 ts: q.ts ? new Date(q.ts * 1000) : null,
                 price: q.price || 0, shares: q.shares || 0, cash: q.cash || 0,
                 side: "BUY", outcome: q.outcome || "", title: q.title || "", slug: q.slug || "",
-            })).filter(t => t.addr && t.conditionId && t.cash >= minCashR.current);
+            })).filter(t => t.addr && t.conditionId && t.cash > 0);
             setFetched(recs.length);
             setExcluded(0);
-            const scored = trades.map(t => {
+            // Aggregate split fills into positions, then gate on summed size.
+            const positions = aggregatePositions(trades).filter(p => p.cash >= minCashR.current);
+            const scored = positions.map(t => {
                 const sig_odds = scoreOdds(t.price * 100);
                 return {
                     ...t, sig_odds, sig_time: null, sig_wr: null, sig_dorm: null,
@@ -640,13 +679,7 @@ function App() {
                     enriched: false, enriching: false,
                 };
             }).filter(t => inOddsBand(t.price * 100, oddsBandR.current));
-            const seen = new Map();
-            scored.forEach(t => {
-                const key = `${t.addr}|${t.conditionId}`;
-                if (!seen.has(key) || t.sig_odds > seen.get(key).sig_odds)
-                    seen.set(key, t);
-            });
-            const deduped = [...seen.values()]
+            const deduped = [...scored]
                 .sort((a, b) => b.cash - a.cash)
                 .sort((a, b) => b.sig_odds - a.sig_odds);
             const fresh = new Set(deduped.filter(t => !prevIds.current.has(t.id)).map(t => t.id));
@@ -811,7 +844,13 @@ function App() {
                     dbMeta && dbMeta.lastRun && (React.createElement("span", { style: { fontSize: 9, color: T.dim, marginLeft: 6 } },
                         "DB updated ",
                         Math.max(0, Math.round((Date.now() - new Date(dbMeta.lastRun).getTime()) / 60000)),
-                        "m ago")),
+                        "m ago",
+                        typeof dbMeta.spanSec === "number" && dbMeta.spanSec > 0 && (React.createElement("span", { style: { color: dbMeta.coverageOk === false ? "#FF7A7A" : T.dim } },
+                            " · ",
+                            "covers ",
+                            dbMeta.spanSec < 120 ? `${dbMeta.spanSec}s` : `${Math.round(dbMeta.spanSec / 60)}m`,
+                            "/run",
+                            dbMeta.coverageOk === false ? " ⚠ gaps" : "")))),
                     dbMeta && dbMeta.error && (React.createElement("span", { style: { fontSize: 9, color: "#FF7A7A", marginLeft: 6 } }, "collector error \u2014 see /api/trades")))),
                 React.createElement("div", { style: { marginLeft: "auto", display: "flex", gap: 5, alignItems: "center" } },
                     React.createElement("span", { style: { fontSize: 9, color: T.dim } }, "Sort:"),
