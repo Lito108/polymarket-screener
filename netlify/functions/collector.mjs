@@ -1,6 +1,6 @@
 // netlify/functions/collector.mjs
 //
-// The always-on collector. Netlify runs this on a schedule (every 5 minutes,
+// The always-on collector. Netlify runs this on a schedule (every 1 minute,
 // see `config` at the bottom) even when nobody has the screener open. Each run:
 //   1. pulls the most recent trades from Polymarket's data-api,
 //   2. keeps only trades matching the screener's insider-relevant defaults:
@@ -149,7 +149,7 @@ export default async () => {
       spanSec,                               // seconds of trading this fetch spanned
       oldestTs,
       newestTs: newestTs || prevNewest,      // carry forward on empty fetches
-      intervalSec: 300,
+      intervalSec: 60,
       gapSec,                                // seconds provably missed this run
       coverageOk: gapSec <= 2,               // <=2s tolerance for timestamp granularity
       gapCount: (prev.gapCount || 0) + (gapSec > 2 ? 1 : 0),
@@ -165,8 +165,8 @@ export default async () => {
 
 // Netlify reads this and runs the function on the cron schedule below —
 // every 5 minutes, around the clock, with no browser involved.
-// CREDIT DIET: Netlify now bills functions as compute credits (no free tier).
-// 5-min cadence + parallel fetches ≈ 0.2 credits/day vs ~1.2/day at 1-min.
-// Trade-off: peak-hour coverage gaps can return — the gap telemetry will show
-// them honestly ("⚠ gap Ns missed"). Restore "* * * * *" if ever on a paid plan.
-export const config = { schedule: "*/5 * * * *" };
+// COST NOTE (measured, Jul 2026): a full billing period of compute — this
+// collector included — totaled 1.4 credits. Deploys (15 credits each) are the
+// only meaningful cost on Netlify's credit plans. So the 1-minute cadence
+// stays: it is what closes peak-hour coverage gaps, and it is nearly free.
+export const config = { schedule: "* * * * *" };
