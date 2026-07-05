@@ -1,6 +1,6 @@
 // netlify/functions/collector.mjs
 //
-// The always-on collector. Netlify runs this on a schedule (every 1 minute,
+// The always-on collector. Netlify runs this on a schedule (every 5 minutes,
 // see `config` at the bottom) even when nobody has the screener open. Each run:
 //   1. pulls the most recent trades from Polymarket's data-api,
 //   2. keeps only trades matching the screener's insider-relevant defaults:
@@ -18,8 +18,10 @@ const DA = "https://data-api.polymarket.com";
 const STORE_MIN_CASH = 100; // dollars — low floor so split fills survive for aggregation
                             // (the UI sums fills per wallet×market, then applies YOUR $500+ gate)
 const MAX_PRICE = 0.75;    // exclusive — entry odds must be BELOW 75%
-const PAGE = 500;          // data-api caps /trades at 500 per request
-const TARGET = 2000;       // pages: offsets 0 / 500 / 1000 / 1500 (API ceiling ~1.5k; loop stops early when hit)
+const PAGE = 500;                        // data-api caps /trades at 500 per request
+const OFFSETS = [0, 500, 1000, 1500];    // fetched IN PARALLEL — compute is billed on
+                                         // run DURATION (GB-hours), so parallel pages
+                                         // literally cost fewer credits than sequential
 const RETAIN_DAYS = 30;    // history window kept in storage
 
 // ── Politics / geopolitics allowlist ──────────────────────────────────────────
@@ -46,23 +48,22 @@ export default async () => {
 
   try {
     // 1) Pull recent trades (paginated, de-duped, stop at API ceiling)
+    // All page offsets fired at once; the API ceiling just yields empty or
+    // duplicate pages past ~1.5k, which the id-dedup below absorbs harmlessly.
+    const results = await Promise.allSettled(OFFSETS.map(o =>
+      fetch(`${DA}/trades?limit=${PAGE}&offset=${o}&takerOnly=true`,
+        { headers: { Accept: "application/json" } }).then(r => (r.ok ? r.json() : []))
+    ));
     const raw = [];
     const seen = new Set();
-    for (let offset = 0; offset < TARGET; offset += PAGE) {
-      const r = await fetch(
-        `${DA}/trades?limit=${PAGE}&offset=${offset}&takerOnly=true`,
-        { headers: { Accept: "application/json" } }
-      );
-      if (!r.ok) throw new Error(`data-api HTTP ${r.status}`);
-      const page = await r.json();
-      if (!Array.isArray(page) || page.length === 0) break;
-      let fresh = 0;
+    for (const res of results) {
+      const page = res.status === "fulfilled" && Array.isArray(res.value) ? res.value : [];
       for (const t of page) {
         const k = t.transactionHash || `${t.proxyWallet}-${t.conditionId}-${t.timestamp}`;
-        if (!seen.has(k)) { seen.add(k); raw.push(t); fresh++; }
+        if (!seen.has(k)) { seen.add(k); raw.push(t); }
       }
-      if (page.length < PAGE || fresh === 0) break;
     }
+    if (!raw.length) throw new Error("data-api returned no trades on any page");
     fetched = raw.length;
     // Coverage telemetry: how many seconds of trading did this fetch actually
     // span? If spanSec < the run interval (60s), the net has no gaps. If it is
@@ -148,7 +149,7 @@ export default async () => {
       spanSec,                               // seconds of trading this fetch spanned
       oldestTs,
       newestTs: newestTs || prevNewest,      // carry forward on empty fetches
-      intervalSec: 60,
+      intervalSec: 300,
       gapSec,                                // seconds provably missed this run
       coverageOk: gapSec <= 2,               // <=2s tolerance for timestamp granularity
       gapCount: (prev.gapCount || 0) + (gapSec > 2 ? 1 : 0),
@@ -164,4 +165,8 @@ export default async () => {
 
 // Netlify reads this and runs the function on the cron schedule below —
 // every 5 minutes, around the clock, with no browser involved.
-export const config = { schedule: "* * * * *" };  // every minute (~43k/mo of 125k free)
+// CREDIT DIET: Netlify now bills functions as compute credits (no free tier).
+// 5-min cadence + parallel fetches ≈ 0.2 credits/day vs ~1.2/day at 1-min.
+// Trade-off: peak-hour coverage gaps can return — the gap telemetry will show
+// them honestly ("⚠ gap Ns missed"). Restore "* * * * *" if ever on a paid plan.
+export const config = { schedule: "*/5 * * * *" };
