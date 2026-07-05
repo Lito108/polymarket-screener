@@ -633,7 +633,7 @@ function App() {
                         const data = await r.json();
                         const heartbeatMs = data && data.meta && data.meta.lastRun
                             ? Date.now() - new Date(data.meta.lastRun).getTime() : Infinity;
-                        if (heartbeatMs < 180000 && Array.isArray(data.trades)) {
+                        if (heartbeatMs < 420000 && Array.isArray(data.trades)) { // collector runs every 5 min; 7-min staleness margin
                             setDbMeta(data.meta || null);
                             kept = data.trades.map(q => ({
                                 id: q.id, addr: q.addr || "", conditionId: q.conditionId || "",
@@ -877,7 +877,7 @@ function App() {
                             React.createElement("span", { style: { fontSize: 8, color: "#FF7A7A", fontFamily: T.mono } },
                                 critCount,
                                 " HIGH/CRIT")))),
-                    React.createElement("div", { style: { fontSize: 11, color: T.dim } }, "own-DB pipeline (collector 1-min) \u00B7 LIVE = last 15m, HISTORY = 30d \u00B7 direct-API fallback \u00B7 cash = price\u00D7size")),
+                    React.createElement("div", { style: { fontSize: 11, color: T.dim } }, "own-DB pipeline (collector 5-min) \u00B7 LIVE = last 15m, HISTORY = 30d \u00B7 direct-API fallback \u00B7 cash = price\u00D7size")),
                 React.createElement("div", { style: { display: "flex", gap: 8, alignItems: "center" } },
                     React.createElement("div", { style: { display: "flex", border: `1px solid ${T.bdr}`, borderRadius: 5, overflow: "hidden" } }, [["live", "LIVE"], ["history", "HISTORY"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMode(v), style: {
                             padding: "7px 13px", fontSize: 10, fontWeight: 700, letterSpacing: 1,
@@ -907,7 +907,7 @@ function App() {
                 React.createElement("div", null,
                     React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "POLITICS / GEO ONLY"),
                     React.createElement("button", { onClick: () => setExcludeNoise(p => !p), style: { padding: "5px 12px", fontSize: 10, background: excludeNoise ? "rgba(249,115,22,.12)" : "transparent", border: `1px solid ${excludeNoise ? "rgba(249,115,22,.32)" : T.bdr}`, color: excludeNoise ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, excludeNoise ? "ON · allowlist" : "OFF · show all")),
-                React.createElement("div", { style: { fontSize: 10, color: T.dim, lineHeight: 1.7, marginLeft: "auto", maxWidth: 290 } }, "POLITICS/GEO ONLY surfaces only markets where insider info is possible: elections, appointments, resignations, sanctions, ceasefires, nuclear, courts/SEC/FDA/FBI, Fed/inflation. Sports, crypto, weather & meme markets are hidden. Flip OFF to see everything (LIVE only; uses the direct API feed). HISTORY reads your own database: politics \u00B7 fills \u2265$100 stored (your $500+ gate applies to the summed position) \u00B7 <75% \u00B7 collected every minute. LIVE reads the last 15 min of the same database (\u22641m lag) and falls back to the direct API if the collector is stale.")))),
+                React.createElement("div", { style: { fontSize: 10, color: T.dim, lineHeight: 1.7, marginLeft: "auto", maxWidth: 290 } }, "POLITICS/GEO ONLY surfaces only markets where insider info is possible: elections, appointments, resignations, sanctions, ceasefires, nuclear, courts/SEC/FDA/FBI, Fed/inflation. Sports, crypto, weather & meme markets are hidden. Flip OFF to see everything (LIVE only; uses the direct API feed). HISTORY reads your own database: politics \u00B7 fills \u2265$100 stored (your $500+ gate applies to the summed position) \u00B7 <75% \u00B7 collected every 5 min. LIVE reads the last 15 min of the same database (\u22645m lag) and falls back to the direct API if the collector is stale.")))),
         React.createElement("div", { style: { borderBottom: `1px solid ${T.bdr}`, padding: "7px 18px" } },
             React.createElement("div", { style: { maxWidth: 1240, margin: "0 auto", display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap" } },
                 [
