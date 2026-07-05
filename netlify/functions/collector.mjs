@@ -42,6 +42,7 @@ export default async () => {
   const store = getStore("trades");
   const startedAt = new Date().toISOString();
   let fetched = 0, kept = 0, added = 0, error = null;
+  let spanSec = 0, oldestTs = 0, newestTs = 0;   // coverage telemetry (function-scoped: used in status write below)
 
   try {
     // 1) Pull recent trades (paginated, de-duped, stop at API ceiling)
@@ -67,7 +68,6 @@ export default async () => {
     // span? If spanSec < the run interval (60s), the net has no gaps. If it is
     // much larger, we saw further back than one interval (fine). If a run ever
     // fetches a window SHORTER than the gap between runs, trades were missed.
-    let spanSec = 0, oldestTs = 0, newestTs = 0;
     if (raw.length) {
       const times = raw.map(r => Number(r.timestamp) || 0).filter(Boolean);
       if (times.length) { oldestTs = Math.min(...times); newestTs = Math.max(...times); spanSec = newestTs - oldestTs; }
@@ -143,7 +143,7 @@ export default async () => {
       coverageOk: spanSec >= 60 || fetched === 0,
       totalRuns: (prev.totalRuns || 0) + 1,
     });
-  } catch { /* non-fatal */ }
+  } catch (e) { console.error("meta/status write failed:", e); }
 
   return new Response(JSON.stringify({ ok: !error, fetched, kept, added, error }), {
     headers: { "Content-Type": "application/json" },
