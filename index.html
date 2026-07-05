@@ -850,7 +850,7 @@ function App() {
                             "covers ",
                             dbMeta.spanSec < 120 ? `${dbMeta.spanSec}s` : `${Math.round(dbMeta.spanSec / 60)}m`,
                             "/run",
-                            dbMeta.coverageOk === false ? " ⚠ gaps" : "")))),
+                            dbMeta.coverageOk === false ? ` ⚠ gap ${dbMeta.gapSec || "?"}s missed` : "")))),
                     dbMeta && dbMeta.error && (React.createElement("span", { style: { fontSize: 9, color: "#FF7A7A", marginLeft: 6 } }, "collector error \u2014 see /api/trades")))),
                 React.createElement("div", { style: { marginLeft: "auto", display: "flex", gap: 5, alignItems: "center" } },
                     React.createElement("span", { style: { fontSize: 9, color: T.dim } }, "Sort:"),
