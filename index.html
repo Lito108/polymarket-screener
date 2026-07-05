@@ -127,6 +127,43 @@ const scoreWR = (w, t) => {
         return 2;
     return 0;
 };
+// Wallet freshness: a wallet whose entire VISIBLE Polymarket history is a
+// handful of positions, now placing a sizable political bet, matches the
+// fresh/concentrated insider signature. Proxy caveat: fully-redeemed markets
+// drop out of the positions API, so confirm true age on-chain (manual check).
+const scoreFresh = total => {
+    if (total === null || total === undefined)
+        return null;
+    if (total <= 2)
+        return 8;
+    if (total <= 5)
+        return 5;
+    if (total <= 10)
+        return 2;
+    return 0;
+};
+// Multi-wallet burst: N distinct wallets (each above the min-cash gate)
+// entering the SAME market, SAME side, within CLUSTER_WINDOW of each other.
+// Burst-in-time is what separates coordination from mere market popularity.
+const CLUSTER_WINDOW_MS = 6 * 3600000; // 6 hours
+const scoreCluster = n => (n >= 5 ? 12 : n >= 4 ? 9 : n >= 3 ? 6 : 0);
+function attachClusters(items) {
+    const groups = new Map();
+    for (const t of items) {
+        const k = `${t.conditionId}|${(t.outcome || "").toLowerCase()}`;
+        if (!groups.has(k))
+            groups.set(k, []);
+        groups.get(k).push(t);
+    }
+    return items.map(t => {
+        const g = groups.get(`${t.conditionId}|${(t.outcome || "").toLowerCase()}`) || [t];
+        const my = t.ts ? t.ts.getTime() : 0;
+        const clusterN = my
+            ? g.filter(o => o.ts && Math.abs(o.ts.getTime() - my) <= CLUSTER_WINDOW_MS).length
+            : g.length;
+        return { ...t, clusterN, sig_cluster: scoreCluster(clusterN) };
+    });
+}
 const scoreDorm = a => {
     if (a === null || a === undefined)
         return null;
@@ -289,7 +326,7 @@ function MiniBar({ label, tier, pts, max, naText }) {
                     background: pts > 0 ? `linear-gradient(90deg,${tc}55,${tc})` : "#16243A", transition: "width .5s ease" } }))));
 }
 function FeedRow({ item, isNew, expanded, onToggle }) {
-    var _a, _b, _c, _d, _e, _f;
+    var _a, _b, _c, _d, _e, _f, _g, _h;
     const score = (_a = item.fullScore) !== null && _a !== void 0 ? _a : item.quickScore;
     const maxScore = (_b = item.fullMax) !== null && _b !== void 0 ? _b : item.quickMax;
     const rk = getR(score);
@@ -321,7 +358,11 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
             React.createElement("td", { style: { padding: "10px 8px" } },
                 React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, color: "#7FBEDB" } }, item.addr ? `${item.addr.slice(0, 6)}…${item.addr.slice(-4)}` : "—")),
             React.createElement("td", { style: { padding: "10px 8px" } },
-                React.createElement("div", { style: { fontSize: 11, color: T.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 260 } }, item.title || `${item.conditionId.slice(0, 28)}…`)),
+                React.createElement("div", { style: { fontSize: 11, color: T.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 260 } },
+                    item.clusterN >= 3 && (React.createElement("span", { style: { color: T.s, fontWeight: 700, marginRight: 5 }, title: `${item.clusterN} wallets entered this side within 6h` },
+                        "\u2691",
+                        item.clusterN)),
+                    item.title || `${item.conditionId.slice(0, 28)}…`)),
             React.createElement("td", { style: { padding: "10px 8px" } },
                 React.createElement("span", { style: { fontFamily: T.mono, fontSize: 12, fontWeight: 700, color: isLowOdds ? T.s : T.a } },
                     pct,
@@ -366,6 +407,10 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                         item.ts && (React.createElement("span", { style: { fontSize: 11, color: T.muted } },
                             "Traded: ",
                             React.createElement("span", { style: { fontFamily: T.mono, color: T.text } }, item.ts.toLocaleString()))),
+                        item.clusterN >= 2 && (React.createElement("span", { style: { fontSize: 11, fontWeight: item.clusterN >= 3 ? 700 : 400, color: item.clusterN >= 3 ? T.s : T.muted } },
+                            "\u2691 ",
+                            item.clusterN,
+                            " wallets, same side, within 6h")),
                         item.slug && (React.createElement("a", { href: `https://polymarket.com/event/${item.slug}`, target: "_blank", rel: "noopener noreferrer", style: { fontSize: 11, color: T.a, textDecoration: "none" } }, "Open on Polymarket \u2197")))),
                 React.createElement("div", { style: { display: "flex", gap: 28, flexWrap: "wrap" } },
                     React.createElement("div", { style: { minWidth: 250, flex: 1 } },
@@ -378,20 +423,22 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                         React.createElement("div", { style: { fontSize: 8, color: T.a, letterSpacing: 1.5, fontWeight: 700, background: `${T.a}10`, padding: "2px 6px", borderRadius: 3, display: "inline-block", marginBottom: 9 } }, "A-TIER"),
                         React.createElement(MiniBar, { label: "Historical Win Rate", tier: "A", pts: item.sig_wr, max: 6, naText: item.enriching ? "enriching…" : "<3 resolved" }),
                         React.createElement(MiniBar, { label: "Post-Resolution Dormancy", tier: "A", pts: item.sig_dorm, max: 7, naText: item.enriching ? "enriching…" : "n/a" }),
+                        React.createElement(MiniBar, { label: "Wallet Freshness", tier: "A", pts: item.sig_fresh, max: 8, naText: item.enriching ? "enriching…" : "n/a" }),
                         React.createElement(MiniBar, { label: "Wallet Age (WC\u00B7TX)", tier: "A", pts: null, max: 10, naText: "manual \u2193" }),
-                        React.createElement(MiniBar, { label: "Multi-Wallet Coord.", tier: "A", pts: null, max: 12, naText: "manual \u2193" })),
+                        React.createElement(MiniBar, { label: "Multi-Wallet Cluster", tier: "A", pts: (_d = item.sig_cluster) !== null && _d !== void 0 ? _d : 0, max: 12 })),
                     React.createElement("div", { style: { minWidth: 180 } },
                         React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 11 } }, "WALLET SNAPSHOT"),
                         item.enriching && (React.createElement("div", { style: { fontSize: 10, color: T.a, display: "flex", gap: 6, alignItems: "center" } },
                             React.createElement("span", { style: { display: "inline-block", animation: "spin .8s linear infinite" } }, "\u21BB"),
                             " Loading positions\u2026")),
                         item.enriched && (React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "7px 18px" } }, [
-                            ["Resolved bets", (_d = item.w_resolved) !== null && _d !== void 0 ? _d : "—"],
-                            ["Wins", (_e = item.w_wins) !== null && _e !== void 0 ? _e : "—"],
+                            ["Resolved bets", (_e = item.w_resolved) !== null && _e !== void 0 ? _e : "—"],
+                            ["Wins", (_f = item.w_wins) !== null && _f !== void 0 ? _f : "—"],
                             ["Win rate", item.w_resolved > 0 ? `${((item.w_wins / item.w_resolved) * 100).toFixed(0)}%` : "—"],
                             ["Total P&L", item.w_pnl != null ? `${item.w_pnl >= 0 ? "+" : ""}$${item.w_pnl.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : "—"],
                             ["Mkt resolves", item.endDate ? item.endDate.toLocaleDateString() : "—"],
-                            ["Open positions", (_f = item.w_open) !== null && _f !== void 0 ? _f : "—"],
+                            ["Open positions", (_g = item.w_open) !== null && _g !== void 0 ? _g : "—"],
+                            ["Lifetime positions", (_h = item.w_total) !== null && _h !== void 0 ? _h : "—"],
                         ].map(([k, v]) => (React.createElement("div", { key: k },
                             React.createElement("div", { style: { fontSize: 9, color: T.dim, marginBottom: 2 } }, k),
                             React.createElement("div", { style: { fontSize: 11, fontFamily: T.mono,
@@ -419,8 +466,8 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                             React.createElement("span", { style: { color: "#1E6490" } }, "\u25CF Wallet Age (10):"),
                             " Gap from wallet creation to first trade",
                             React.createElement("br", null),
-                            React.createElement("span", { style: { color: "#1E6490" } }, "\u25CF Multi-Wallet (12):"),
-                            " Same funder, same side, same market"))))))));
+                            React.createElement("span", { style: { color: "#1E6490" } }, "\u25CF Multi-Wallet:"),
+                            " same-side burst auto-scored above \u2014 confirm shared FUNDER on Polygonscan"))))))));
 }
 function Steps({ phase }) {
     const LIST = [
@@ -499,11 +546,13 @@ function App() {
             const sig_time = scoreTiming(hours);
             const sig_wr = scoreWR(w.wins, w.resolved);
             const sig_dorm = scoreDorm(w.afterWin);
-            const parts = [r.sig_odds, sig_time, sig_wr, sig_dorm].filter(x => x !== null && x !== undefined);
-            const maxParts = 24 + (sig_time !== null ? 22 : 0) + 6 + (sig_dorm !== null ? 7 : 0);
+            const sig_fresh = scoreFresh(w.total);
+            const parts = [r.sig_odds, r.sig_cluster, sig_time, sig_wr, sig_dorm, sig_fresh]
+                .filter(x => x !== null && x !== undefined);
+            const maxParts = 24 + 12 + (sig_time !== null ? 22 : 0) + 6 + (sig_dorm !== null ? 7 : 0) + 8;
             return {
-                ...r, endDate, hours, sig_time, sig_wr, sig_dorm,
-                w_wins: w.wins, w_resolved: w.resolved, w_pnl: w.pnl, w_open: w.open,
+                ...r, endDate, hours, sig_time, sig_wr, sig_dorm, sig_fresh,
+                w_wins: w.wins, w_resolved: w.resolved, w_pnl: w.pnl, w_open: w.open, w_total: w.total,
                 fullScore: parts.reduce((a, b) => a + b, 0), fullMax: maxParts,
                 enriched: true, enriching: false,
             };
@@ -524,7 +573,7 @@ function App() {
             const byCondition = {};
             positions.forEach(p => { if (p.conditionId)
                 byCondition[p.conditionId] = p; });
-            const w = { wins, resolved: resolvedPos.length, pnl, open, afterWin, byCondition };
+            const w = { wins, resolved: resolvedPos.length, pnl, open, afterWin, total: positions.length, byCondition };
             posCache.current[item.addr] = w;
             apply(w);
         }
@@ -606,16 +655,21 @@ function App() {
                 const sig_odds = scoreOdds(t.price * 100);
                 return {
                     ...t, sig_odds, sig_time: null, sig_wr: null, sig_dorm: null,
-                    hours: null, endDate: null, quickScore: sig_odds, quickMax: 24,
-                    fullScore: null, fullMax: null,
-                    w_wins: null, w_resolved: null, w_pnl: null, w_open: null,
+                    hours: null, endDate: null,
+                    fullScore: null, fullMax: null, sig_fresh: null,
+                    w_wins: null, w_resolved: null, w_pnl: null, w_open: null, w_total: null,
                     enriched: false, enriching: false,
                 };
-            }).filter(t => inOddsBand(t.price * 100, oddsBandR.current));
+            });
+            // Burst-cluster detection runs BEFORE the odds-band filter, so wallets in
+            // hidden bands still count toward a coordinated same-side entry.
+            const clustered = attachClusters(scored).map(t => ({
+                ...t, quickScore: t.sig_odds + t.sig_cluster, quickMax: 36,
+            })).filter(t => inOddsBand(t.price * 100, oddsBandR.current));
             // Positions are already unique per wallet×market×outcome; just sort.
-            const deduped = [...scored]
+            const deduped = [...clustered]
                 .sort((a, b) => b.cash - a.cash)
-                .sort((a, b) => b.sig_odds - a.sig_odds);
+                .sort((a, b) => b.quickScore - a.quickScore);
             const fresh = new Set(deduped.filter(t => !prevIds.current.has(t.id)).map(t => t.id));
             prevIds.current = new Set(deduped.map(t => t.id));
             setNewIds(fresh);
@@ -673,15 +727,20 @@ function App() {
                 const sig_odds = scoreOdds(t.price * 100);
                 return {
                     ...t, sig_odds, sig_time: null, sig_wr: null, sig_dorm: null,
-                    hours: null, endDate: null, quickScore: sig_odds, quickMax: 24,
-                    fullScore: null, fullMax: null,
-                    w_wins: null, w_resolved: null, w_pnl: null, w_open: null,
+                    hours: null, endDate: null,
+                    fullScore: null, fullMax: null, sig_fresh: null,
+                    w_wins: null, w_resolved: null, w_pnl: null, w_open: null, w_total: null,
                     enriched: false, enriching: false,
                 };
-            }).filter(t => inOddsBand(t.price * 100, oddsBandR.current));
-            const deduped = [...scored]
+            });
+            // Burst-cluster detection runs BEFORE the odds-band filter, so wallets in
+            // hidden bands still count toward a coordinated same-side entry.
+            const clustered = attachClusters(scored).map(t => ({
+                ...t, quickScore: t.sig_odds + t.sig_cluster, quickMax: 36,
+            })).filter(t => inOddsBand(t.price * 100, oddsBandR.current));
+            const deduped = [...clustered]
                 .sort((a, b) => b.cash - a.cash)
-                .sort((a, b) => b.sig_odds - a.sig_odds);
+                .sort((a, b) => b.quickScore - a.quickScore);
             const fresh = new Set(deduped.filter(t => !prevIds.current.has(t.id)).map(t => t.id));
             const switched = prevModeR.current !== "history";
             prevModeR.current = "history";
@@ -894,7 +953,7 @@ function App() {
                 React.createElement("div", { style: { padding: "12px 18px", borderTop: `1px solid ${T.bdr}` } },
                     React.createElement("span", { style: { fontSize: 10, color: T.dim, lineHeight: 1.85 } },
                         sorted.length,
-                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots) \u00B7 shown bands default to <10% and 60\u201375% (10\u201360% and 75%+ hidden) \u00B7 Timing/Win-Rate/Dormancy fill in from each wallet's /positions \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Resolution window hides markets resolving >30 days out or already resolved (unknown dates stay) \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
+                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots) \u00B7 shown bands default to <10% and 60\u201375% (10\u201360% and 75%+ hidden) \u00B7 Timing/Win-Rate/Dormancy/Freshness fill in from each wallet's /positions (Freshness = visible lifetime positions, a proxy \u2014 confirm age on-chain) \u00B7 Multi-Wallet Cluster = distinct wallets \u2265 min-cash entering the same side within 6h, auto-scored \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Resolution window hides markets resolving >30 days out or already resolved (unknown dates stay) \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
 
