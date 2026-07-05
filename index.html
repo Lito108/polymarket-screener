@@ -21,6 +21,7 @@ const { useState, useEffect, useCallback, useRef } = React;
 //  Privacy Bridge & Wallet Age need Polygonscan → remain manual (row links).
 // ════════════════════════════════════════════════════════════════════════════
 const DA = "https://data-api.polymarket.com";
+const LIVE_WINDOW_MIN = 15; // LIVE mode shows the last N minutes from our own DB
 const T = {
     bg: "#07080F", panel: "#0C1120", bdr: "#1E2B3D", text: "#F4F8FD",
     muted: "#CBD8E6", dim: "#9DB0C2", mono: "'Courier New', monospace",
@@ -491,6 +492,7 @@ function App() {
     const [mode, setMode] = useState("live"); // "live" snapshot | "history" database
     const [histDays, setHistDays] = useState(3); // history window (days)
     const [dbMeta, setDbMeta] = useState(null); // collector status from /api/trades
+    const [liveSrc, setLiveSrc] = useState("direct"); // which path served the last LIVE scan
     const [showCtrl, setShowCtrl] = useState(false);
     const [sortBy, setSortBy] = useState("score");
     const [feed, setFeed] = useState([]);
@@ -615,39 +617,72 @@ function App() {
             // The data-api caps /trades at 500 per request, so to pull 1,000 we fetch
             // two pages via offset (0 and 500) and combine them. If a page comes back
             // short, there's no more data and we stop early.
-            // The data-api caps /trades at 500 per request, so to pull 2,000 we page
-            // through with offset (0, 500, 1000, 1500). We de-dup by transaction hash
-            // and stop early if a page returns nothing new — that handles both the end
-            // of available trades and the API's offset ceiling on high-activity feeds.
-            const PAGE = 500, TARGET = 2000;
-            let raw = [];
-            const seenTx = new Set();
-            for (let offset = 0; offset < TARGET; offset += PAGE) {
-                const page = await jFetch(`${DA}/trades?limit=${PAGE}&offset=${offset}&takerOnly=true`);
-                if (!Array.isArray(page) || page.length === 0)
-                    break;
-                let added = 0;
-                for (const t of page) {
-                    const key = t.transactionHash || `${t.proxyWallet}-${t.conditionId}-${t.timestamp}`;
-                    if (!seenTx.has(key)) {
-                        seenTx.add(key);
-                        raw.push(t);
-                        added++;
+            // ── Path A (preferred): read OUR database. The collector already pulls
+            // the identical firehose server-side every minute, so re-downloading ~1MB
+            // of raw trades here is redundant — the DB slice is a few KB and at most
+            // ~60s stale. Requires politics-only mode (the DB stores only political
+            // trades) and a fresh collector heartbeat; otherwise fall through.
+            let kept = [];
+            let pulled = 0;
+            let offTopic = 0;
+            let src = "direct";
+            if (politicsOnlyR.current) {
+                try {
+                    const r = await fetch(`/api/trades?minutes=${LIVE_WINDOW_MIN}`, { headers: { Accept: "application/json" } });
+                    if (r.ok) {
+                        const data = await r.json();
+                        const heartbeatMs = data && data.meta && data.meta.lastRun
+                            ? Date.now() - new Date(data.meta.lastRun).getTime() : Infinity;
+                        if (heartbeatMs < 180000 && Array.isArray(data.trades)) {
+                            setDbMeta(data.meta || null);
+                            kept = data.trades.map(q => ({
+                                id: q.id, addr: q.addr || "", conditionId: q.conditionId || "",
+                                ts: q.ts ? new Date(q.ts * 1000) : null,
+                                price: q.price || 0, shares: q.shares || 0, cash: q.cash || 0,
+                                side: "BUY", outcome: q.outcome || "", title: q.title || "", slug: q.slug || "",
+                            })).filter(t => t.addr && t.conditionId && t.cash > 0);
+                            pulled = typeof data.count === "number" ? data.count : kept.length;
+                            src = "db";
+                        }
                     }
                 }
-                if (page.length < PAGE)
-                    break; // reached the end of available trades
-                if (added === 0)
-                    break; // offset not advancing → stop (no dupes piled up)
+                catch ( /* DB unreachable → direct fallback below */_a) { /* DB unreachable → direct fallback below */ }
             }
-            if (!raw.length)
-                throw new Error("No trades returned from data-api.");
+            // ── Path B (fallback / politics-off): direct data-api fetch, paginated
+            // to the API's offset ceiling, de-duped by transaction hash.
+            if (src !== "db") {
+                const PAGE = 500, TARGET = 2000;
+                const raw = [];
+                const seenTx = new Set();
+                for (let offset = 0; offset < TARGET; offset += PAGE) {
+                    const page = await jFetch(`${DA}/trades?limit=${PAGE}&offset=${offset}&takerOnly=true`);
+                    if (!Array.isArray(page) || page.length === 0)
+                        break;
+                    let added = 0;
+                    for (const t of page) {
+                        const key = t.transactionHash || `${t.proxyWallet}-${t.conditionId}-${t.timestamp}`;
+                        if (!seenTx.has(key)) {
+                            seenTx.add(key);
+                            raw.push(t);
+                            added++;
+                        }
+                    }
+                    if (page.length < PAGE)
+                        break; // reached the end of available trades
+                    if (added === 0)
+                        break; // offset not advancing → stop
+                }
+                if (!raw.length)
+                    throw new Error("No trades returned from data-api.");
+                const buys = raw.map(parseTrade).filter(t => t.side === "BUY" && t.addr && t.conditionId && t.cash > 0);
+                kept = politicsOnlyR.current ? buys.filter(t => isRelevant(t.title)) : buys;
+                offTopic = buys.length - kept.length;
+                pulled = raw.length;
+            }
+            setLiveSrc(src);
             setPhase("scoring");
-            // Parse all qualifying BUY fills (NO cash gate yet — we gate the aggregate).
-            const buys = raw.map(parseTrade).filter(t => t.side === "BUY" && t.addr && t.conditionId && t.cash > 0);
-            const kept = politicsOnlyR.current ? buys.filter(t => isRelevant(t.title)) : buys;
-            setExcluded(buys.length - kept.length);
-            setFetched(raw.length);
+            setExcluded(offTopic);
+            setFetched(pulled);
             // Aggregate split fills into positions, THEN apply the min-cash gate so a
             // whale accumulating in small tranches is caught by summed size.
             const positions = aggregatePositions(kept).filter(p => p.cash >= minCashR.current);
@@ -842,7 +877,7 @@ function App() {
                             React.createElement("span", { style: { fontSize: 8, color: "#FF7A7A", fontFamily: T.mono } },
                                 critCount,
                                 " HIGH/CRIT")))),
-                    React.createElement("div", { style: { fontSize: 11, color: T.dim } }, "data-api \u00B7 politics/geo allowlist \u00B7 LIVE snapshot + HISTORY database (30-day) \u00B7 cash = price\u00D7size")),
+                    React.createElement("div", { style: { fontSize: 11, color: T.dim } }, "own-DB pipeline (collector 1-min) \u00B7 LIVE = last 15m, HISTORY = 30d \u00B7 direct-API fallback \u00B7 cash = price\u00D7size")),
                 React.createElement("div", { style: { display: "flex", gap: 8, alignItems: "center" } },
                     React.createElement("div", { style: { display: "flex", border: `1px solid ${T.bdr}`, borderRadius: 5, overflow: "hidden" } }, [["live", "LIVE"], ["history", "HISTORY"]].map(([v, l]) => (React.createElement("button", { key: v, onClick: () => setMode(v), style: {
                             padding: "7px 13px", fontSize: 10, fontWeight: 700, letterSpacing: 1,
@@ -872,11 +907,12 @@ function App() {
                 React.createElement("div", null,
                     React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "POLITICS / GEO ONLY"),
                     React.createElement("button", { onClick: () => setExcludeNoise(p => !p), style: { padding: "5px 12px", fontSize: 10, background: excludeNoise ? "rgba(249,115,22,.12)" : "transparent", border: `1px solid ${excludeNoise ? "rgba(249,115,22,.32)" : T.bdr}`, color: excludeNoise ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, excludeNoise ? "ON · allowlist" : "OFF · show all")),
-                React.createElement("div", { style: { fontSize: 10, color: T.dim, lineHeight: 1.7, marginLeft: "auto", maxWidth: 290 } }, "POLITICS/GEO ONLY surfaces only markets where insider info is possible: elections, appointments, resignations, sanctions, ceasefires, nuclear, courts/SEC/FDA/FBI, Fed/inflation. Sports, crypto, weather & meme markets are hidden. Flip OFF to see everything (LIVE mode only). HISTORY reads your own database: politics \u00B7 fills \u2265$100 stored (your $500+ gate applies to the summed position) \u00B7 <75% \u00B7 collected every minute.")))),
+                React.createElement("div", { style: { fontSize: 10, color: T.dim, lineHeight: 1.7, marginLeft: "auto", maxWidth: 290 } }, "POLITICS/GEO ONLY surfaces only markets where insider info is possible: elections, appointments, resignations, sanctions, ceasefires, nuclear, courts/SEC/FDA/FBI, Fed/inflation. Sports, crypto, weather & meme markets are hidden. Flip OFF to see everything (LIVE only; uses the direct API feed). HISTORY reads your own database: politics \u00B7 fills \u2265$100 stored (your $500+ gate applies to the summed position) \u00B7 <75% \u00B7 collected every minute. LIVE reads the last 15 min of the same database (\u22641m lag) and falls back to the direct API if the collector is stale.")))),
         React.createElement("div", { style: { borderBottom: `1px solid ${T.bdr}`, padding: "7px 18px" } },
             React.createElement("div", { style: { maxWidth: 1240, margin: "0 auto", display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap" } },
                 [
                     ["Trades pulled", fetched || (scanning ? "…" : "0")],
+                    ["Source", mode === "history" ? `DB ${histDays}d` : (liveSrc === "db" ? `DB ${LIVE_WINDOW_MIN}m` : "direct API")],
                     ["Off-topic cut", excludeNoise ? excluded : "off"],
                     ["Flagged", visible.length || (scanning ? "…" : "0")],
                     [">30d cut", resolve30 ? Math.max(0, feed.length - visible.length) : "off"],
