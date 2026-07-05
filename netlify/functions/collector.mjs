@@ -131,16 +131,28 @@ export default async () => {
   // 5) Status record for the UI ("DB updated Xm ago")
   try {
     const prev = (await store.get("meta/status", { type: "json" })) || {};
+    // TRUE gap detection: if this fetch's OLDEST trade overlaps the PREVIOUS
+    // run's NEWEST trade, coverage is provably continuous. If it starts later,
+    // the difference is a real, measured hole in the net — not a guess.
+    const prevNewest = Number(prev.newestTs) || 0;
+    let gapSec = 0;
+    if (fetched > 0 && oldestTs > 0 && prevNewest > 0 && oldestTs > prevNewest) {
+      gapSec = oldestTs - prevNewest;
+    }
     await store.setJSON("meta/status", {
       lastRun: startedAt,
       fetched,
       kept,
       added,
       error,
-      spanSec,           // seconds of trading covered by this fetch
-      oldestTs, newestTs,
-      intervalSec: 60,   // collector cadence; spanSec should exceed this
-      coverageOk: spanSec >= 60 || fetched === 0,
+      spanSec,                               // seconds of trading this fetch spanned
+      oldestTs,
+      newestTs: newestTs || prevNewest,      // carry forward on empty fetches
+      intervalSec: 60,
+      gapSec,                                // seconds provably missed this run
+      coverageOk: gapSec <= 2,               // <=2s tolerance for timestamp granularity
+      gapCount: (prev.gapCount || 0) + (gapSec > 2 ? 1 : 0),
+      gapSecTotal: (prev.gapSecTotal || 0) + gapSec,
       totalRuns: (prev.totalRuns || 0) + 1,
     });
   } catch (e) { console.error("meta/status write failed:", e); }
