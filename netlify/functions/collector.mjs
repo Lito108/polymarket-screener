@@ -33,9 +33,16 @@ const OFFICE_RE = /\b(resign\w*|step down|steps down|stepping down|ousted?|out a
 const GEO_RE = /\b(cease[- ]?fire|armistice|peace deal|peace talks|peace agreement|truce|sanction\w*|embargo|treaty|summit|NATO|united nations|G7|G20|nuclear|air ?strike|military strike|missile strike|missile|invasion|invade|coup|regime|overthrow|annex\w*|hostage|prisoner swap|strait of hormuz|hormuz|strait|drone strike|martial law|deploy troops|troops to|declares? war|go to war|war (before|by|with|breaks out)|strike (iran|israel|russia|china|north korea|ukraine|gaza|taiwan|syria))\b/i;
 const LEGAL_RE = /\b(SEC|FDA|FTC|DOJ|FBI|CIA|antitrust|indict\w*|convicted|verdict|ruling|supreme court|SCOTUS|lawsuit|subpoena|FISA|reauthoriz\w*|confirmed as|merger|acquisition|IPO|bankruptcy|delisting|recall|investigation|probe|CEO|fired as|sued?|pardon|executive order|extradit\w*|state of emergency)\b/i;
 const MACRO_RE = /\b(fed|FOMC|interest rate|rate (cut|hike|decision)|powell|inflation|CPI|recession|GDP|unemployment|jobs report|debt ceiling|shutdown|government shutdown|budget|tariff\w*|trade deal|debt default)\b/i;
+// Esports/sports veto: overrides the allowlist. A sports title containing an
+// allowlist keyword (tournament names, sponsor words) can otherwise leak
+// through — observed live with a Counter-Strike match. Narrow on purpose:
+// only unambiguous esports/series tokens, so political "X vs Y debate"
+// markets are never caught. KEEP IN SYNC in index.html and collector.mjs.
+const DENY_RE = /\b(counter[- ]?strike|cs:?go|cs2|dota ?2|valorant|overwatch|rocket league|league of legends|esports|bo[1357])\b/i;
 const isRelevant = (title = "") =>
-  GOV_RE.test(title) || OFFICE_RE.test(title) || GEO_RE.test(title) ||
-  LEGAL_RE.test(title) || MACRO_RE.test(title);
+  !DENY_RE.test(title) &&
+  (GOV_RE.test(title) || OFFICE_RE.test(title) || GEO_RE.test(title) ||
+   LEGAL_RE.test(title) || MACRO_RE.test(title));
 
 // UTC day key for a unix-seconds timestamp, e.g. "2026-06-19"
 const dayKey = (tsSec) => new Date(tsSec * 1000).toISOString().slice(0, 10);
