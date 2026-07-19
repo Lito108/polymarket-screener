@@ -132,6 +132,25 @@ const scoreWR = (w, t) => {
 // handful of positions, now placing a sizable political bet, matches the
 // fresh/concentrated insider signature. Proxy caveat: fully-redeemed markets
 // drop out of the positions API, so confirm true age on-chain (manual check).
+// Serial-gambler demotion: a wallet with ZERO wins across 10+ resolved bets
+// that keeps buying longshots is near-proof of a lottery habit, not inside
+// information — so it SUBTRACTS points instead of merely scoring zero. The
+// penalty scales with how conclusive the record is. Fresh wallets are immune
+// by construction (resolved < 10 can never trigger). Same caveat as
+// Freshness: this reads VISIBLE resolved history from the positions API.
+const scoreGambler = (wins, resolved) => {
+    if (resolved === null || resolved === undefined)
+        return null;
+    if (wins > 0 || resolved < 10)
+        return 0;
+    if (resolved >= 100)
+        return -25;
+    if (resolved >= 50)
+        return -20;
+    if (resolved >= 25)
+        return -15;
+    return -10; // 0 wins in 10-24 resolved
+};
 const scoreFresh = total => {
     if (total === null || total === undefined)
         return null;
@@ -430,6 +449,12 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                         React.createElement("div", { style: { height: 1, background: T.bdr, margin: "9px 0" } }),
                         React.createElement("div", { style: { fontSize: 8, color: T.a, letterSpacing: 1.5, fontWeight: 700, background: `${T.a}10`, padding: "2px 6px", borderRadius: 3, display: "inline-block", marginBottom: 9 } }, "A-TIER"),
                         React.createElement(MiniBar, { label: "Historical Win Rate", tier: "A", pts: item.sig_wr, max: 6, naText: item.enriching ? "enriching…" : "<3 resolved" }),
+                        item.sig_gambler != null && item.sig_gambler < 0 && (React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 9, padding: "5px 9px", background: "rgba(255,59,59,.07)", border: "1px solid rgba(255,59,59,.22)", borderRadius: 4 } },
+                            React.createElement("span", { style: { fontSize: 11, color: "#FF8A8A" } },
+                                "Serial-gambler demotion \u2014 0 wins in ",
+                                item.w_resolved,
+                                " resolved"),
+                            React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, fontWeight: 700, color: "#FF6B6B" } }, item.sig_gambler))),
                         React.createElement(MiniBar, { label: "Post-Resolution Dormancy", tier: "A", pts: item.sig_dorm, max: 7, naText: item.enriching ? "enriching…" : "n/a" }),
                         React.createElement(MiniBar, { label: "Wallet Freshness", tier: "A", pts: item.sig_fresh, max: 8, naText: item.enriching ? "enriching…" : "n/a" }),
                         React.createElement(MiniBar, { label: "Wallet Age (WC\u00B7TX)", tier: "A", pts: null, max: 10, naText: "manual \u2193" }),
@@ -468,14 +493,15 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                                 React.createElement("span", null, "Full wallet on-chain"),
                                 React.createElement("span", { style: { opacity: .6 } }, "Polygonscan \u2197"))),
                         React.createElement("div", { style: { fontSize: 9, color: T.dim, lineHeight: 1.8 } },
-                            React.createElement("span", { style: { color: "#C0480A" } }, "\u25CF Privacy Bridge (25):"),
-                            " Railgun inflows on Polygonscan",
+                            React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 1.5, fontWeight: 700, marginBottom: 4 } }, "HOW TO SCORE THE MANUAL CHECKS \u2014 these are instructions, not findings:"),
+                            React.createElement("span", { style: { color: "#E06A2B" } }, "\u25CF Privacy Bridge (+25):"),
+                            " open \"Check funding source\" and look for USDC arriving FROM Railgun/Tornado. If deposits mint from Null 0x000\u2026 (pUSD proxy era), the origin is unresolvable by design \u2014 score 0 and lean on Wallet Age instead.",
                             React.createElement("br", null),
-                            React.createElement("span", { style: { color: "#1E6490" } }, "\u25CF Wallet Age (10):"),
-                            " Gap from wallet creation to first trade",
+                            React.createElement("span", { style: { color: "#4C94C4" } }, "\u25CF Wallet Age (+10):"),
+                            " the Polygonscan header \"Contract Creator \u2026 N ago\" is the account's birth. Created right before this bet = fresh burner.",
                             React.createElement("br", null),
-                            React.createElement("span", { style: { color: "#1E6490" } }, "\u25CF Multi-Wallet:"),
-                            " same-side burst auto-scored above \u2014 confirm shared FUNDER on Polygonscan"))))))));
+                            React.createElement("span", { style: { color: "#4C94C4" } }, "\u25CF Multi-Wallet:"),
+                            " the same-side burst is auto-scored above; on-chain, confirm a shared FUNDER. Ignore matching \"contract creator\" \u2014 that is Polymarket's factory on every wallet."))))))));
 }
 function Steps({ phase }) {
     const LIST = [
@@ -556,13 +582,16 @@ function App() {
             const sig_wr = scoreWR(w.wins, w.resolved);
             const sig_dorm = scoreDorm(w.afterWin);
             const sig_fresh = scoreFresh(w.total);
+            const sig_gambler = scoreGambler(w.wins, w.resolved); // 0 or NEGATIVE
             const parts = [r.sig_odds, r.sig_cluster, sig_time, sig_wr, sig_dorm, sig_fresh]
                 .filter(x => x !== null && x !== undefined);
             const maxParts = 24 + 12 + (sig_time !== null ? 22 : 0) + 6 + (sig_dorm !== null ? 7 : 0) + 8;
             return {
                 ...r, endDate, hours, sig_time, sig_wr, sig_dorm, sig_fresh,
                 w_wins: w.wins, w_resolved: w.resolved, w_pnl: w.pnl, w_open: w.open, w_total: w.total,
-                fullScore: parts.reduce((a, b) => a + b, 0), fullMax: maxParts,
+                sig_gambler,
+                fullScore: Math.max(0, parts.reduce((a, b) => a + b, 0) + (sig_gambler || 0)),
+                fullMax: maxParts,
                 enriched: true, enriching: false,
             };
         }));
@@ -698,7 +727,7 @@ function App() {
                 return {
                     ...t, sig_odds, sig_time: null, sig_wr: null, sig_dorm: null,
                     hours: null, endDate: null,
-                    fullScore: null, fullMax: null, sig_fresh: null,
+                    fullScore: null, fullMax: null, sig_fresh: null, sig_gambler: null,
                     w_wins: null, w_resolved: null, w_pnl: null, w_open: null, w_total: null,
                     enriched: false, enriching: false,
                 };
@@ -770,7 +799,7 @@ function App() {
                 return {
                     ...t, sig_odds, sig_time: null, sig_wr: null, sig_dorm: null,
                     hours: null, endDate: null,
-                    fullScore: null, fullMax: null, sig_fresh: null,
+                    fullScore: null, fullMax: null, sig_fresh: null, sig_gambler: null,
                     w_wins: null, w_resolved: null, w_pnl: null, w_open: null, w_total: null,
                     enriched: false, enriching: false,
                 };
@@ -996,7 +1025,7 @@ function App() {
                 React.createElement("div", { style: { padding: "12px 18px", borderTop: `1px solid ${T.bdr}` } },
                     React.createElement("span", { style: { fontSize: 10, color: T.dim, lineHeight: 1.85 } },
                         sorted.length,
-                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots) \u00B7 shown bands default to <10% and 60\u201375% (10\u201360% and 75%+ hidden) \u00B7 Timing/Win-Rate/Dormancy/Freshness fill in from each wallet's /positions (Freshness = visible lifetime positions, a proxy \u2014 confirm age on-chain) \u00B7 Multi-Wallet Cluster = distinct wallets \u2265 min-cash entering the same side within 6h, auto-scored \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Resolution window hides markets resolving >30 days out or already resolved (unknown dates stay) \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
+                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots) \u00B7 shown bands default to <10% and 60\u201375% (10\u201360% and 75%+ hidden) \u00B7 Timing/Win-Rate/Dormancy/Freshness fill in from each wallet's /positions (Freshness = visible lifetime positions, a proxy \u2014 confirm age on-chain) \u00B7 wallets with 0 wins in 10+ resolved take a serial-gambler score penalty (\u221210 to \u221225) \u00B7 Multi-Wallet Cluster = distinct wallets \u2265 min-cash entering the same side within 6h, auto-scored \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Resolution window hides markets resolving >30 days out or already resolved (unknown dates stay) \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
 
