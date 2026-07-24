@@ -21,6 +21,8 @@ const { useState, useEffect, useCallback, useRef } = React;
 //  Privacy Bridge & Wallet Age need Polygonscan → remain manual (row links).
 // ════════════════════════════════════════════════════════════════════════════
 const DA = "https://data-api.polymarket.com";
+const POS_LIMIT = 500; // /positions page size; >= this means truncated history
+const POS_TTL_MS = 30 * 60000; // wallet stats go stale in a long-lived session — refetch after 30 min
 const LIVE_WINDOW_MIN = 15; // LIVE mode shows the last N minutes from our own DB
 const T = {
     bg: "#07080F", panel: "#0C1120", bdr: "#1E2B3D", text: "#F4F8FD",
@@ -81,13 +83,17 @@ function aggregatePositions(trades) {
         const key = `${t.addr}|${t.conditionId}|${(t.outcome || "").toLowerCase()}`;
         let g = groups.get(key);
         if (!g) {
-            g = { ...t, cash: 0, shares: 0, fills: 0, _pv: 0, firstTs: t.ts, lastTs: t.ts };
+            g = { ...t, cash: 0, shares: 0, fills: 0, _pv: 0, _tw: 0, _twCash: 0, firstTs: t.ts, lastTs: t.ts };
             groups.set(key, g);
         }
         g.cash += t.cash;
         g.shares += t.shares;
         g._pv += t.price * t.shares; // price·shares, for weighted average
         g.fills += 1;
+        if (t.ts) {
+            g._tw += t.ts.getTime() * t.cash;
+            g._twCash += t.cash;
+        }
         if (t.ts && (!g.firstTs || t.ts < g.firstTs))
             g.firstTs = t.ts;
         if (t.ts && (!g.lastTs || t.ts > g.lastTs))
@@ -96,12 +102,35 @@ function aggregatePositions(trades) {
     const out = [];
     for (const g of groups.values()) {
         g.price = g.shares > 0 ? g._pv / g.shares : g.price; // share-weighted avg entry
-        g.ts = g.firstTs; // first entry = timing anchor
+        g.ts = g.firstTs; // display + cluster anchor
+        // TIMING anchor = DOLLAR-WEIGHTED entry time. Scoring timing off the first
+        // fill understates the classic pattern (open small early, load up hours
+        // before resolution); scoring off the last fill overstates a tiny top-up.
+        // Weighting by cash answers the real question: when did the MONEY commit?
+        g.wTs = g._twCash > 0 ? new Date(g._tw / g._twCash) : g.firstTs;
         g.id = `${g.addr}|${g.conditionId}|${(g.outcome || "").toLowerCase()}`;
         delete g._pv;
+        delete g._tw;
+        delete g._twCash;
         out.push(g);
     }
     return out;
+}
+// Alert triggers. Aggregation keeps a position's id stable across scans, so a
+// whale ADDING to a position would otherwise be silent — and with LIVE now
+// reading a 15-minute DB window against a 5-minute refresh, ringing on mere
+// presence re-rings the same trade up to three times. Ring on arrival OR growth.
+const GROWTH_TRIGGER = 1.25; // +25% cash since the previous scan
+function diffPositions(positions, prevMap) {
+    const fresh = new Set(), grown = new Set();
+    for (const p of positions) {
+        const before = prevMap.get(p.id);
+        if (before === undefined)
+            fresh.add(p.id);
+        else if (p.cash >= before * GROWTH_TRIGGER)
+            grown.add(p.id);
+    }
+    return { fresh, grown };
 }
 const scoreTiming = h => {
     if (h === null || h === undefined || h < 0)
@@ -353,7 +382,7 @@ function MiniBar({ label, tier, pts, max, naText }) {
                     background: pts > 0 ? `linear-gradient(90deg,${tc}55,${tc})` : "#16243A", transition: "width .5s ease" } }))));
 }
 function FeedRow({ item, isNew, expanded, onToggle }) {
-    var _a, _b, _c, _d, _e, _f, _g, _h;
+    var _a, _b, _c, _d, _e, _f, _g;
     const score = (_a = item.fullScore) !== null && _a !== void 0 ? _a : item.quickScore;
     const maxScore = (_b = item.fullMax) !== null && _b !== void 0 ? _b : item.quickMax;
     const rk = getR(score);
@@ -432,8 +461,12 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                                 item.fills,
                                 " fills (avg entry, split accumulation)"))),
                         item.ts && (React.createElement("span", { style: { fontSize: 11, color: T.muted } },
-                            "Traded: ",
+                            item.fills > 1 ? "First fill: " : "Traded: ",
                             React.createElement("span", { style: { fontFamily: T.mono, color: T.text } }, item.ts.toLocaleString()))),
+                        item.fills > 1 && item.lastTs && (React.createElement("span", { style: { fontSize: 11, color: T.muted } },
+                            "Last fill: ",
+                            React.createElement("span", { style: { fontFamily: T.mono, color: T.s } }, item.lastTs.toLocaleString()),
+                            React.createElement("span", { style: { color: T.dim } }, " \u00B7 timing scored on $-weighted entry"))),
                         item.clusterN >= 2 && (React.createElement("span", { style: { fontSize: 11, fontWeight: item.clusterN >= 3 ? 700 : 400, color: item.clusterN >= 3 ? T.s : T.muted } },
                             "\u2691 ",
                             item.clusterN,
@@ -471,7 +504,7 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                             ["Total P&L", item.w_pnl != null ? `${item.w_pnl >= 0 ? "+" : ""}$${item.w_pnl.toLocaleString(undefined, { maximumFractionDigits: 0 })}` : "—"],
                             ["Mkt resolves", item.endDate ? item.endDate.toLocaleDateString() : "—"],
                             ["Open positions", (_g = item.w_open) !== null && _g !== void 0 ? _g : "—"],
-                            ["Lifetime positions", (_h = item.w_total) !== null && _h !== void 0 ? _h : "—"],
+                            ["Lifetime positions", item.w_total != null ? (item.w_truncated ? `${item.w_total}+ partial` : item.w_total) : "—"],
                         ].map(([k, v]) => (React.createElement("div", { key: k },
                             React.createElement("div", { style: { fontSize: 9, color: T.dim, marginBottom: 2 } }, k),
                             React.createElement("div", { style: { fontSize: 11, fontFamily: T.mono,
@@ -537,7 +570,7 @@ function App() {
     const [newIds, setNewIds] = useState(new Set());
     const [errMsg, setErrMsg] = useState("");
     const posCache = useRef({});
-    const prevIds = useRef(new Set());
+    const prevPos = useRef(new Map()); // id -> cash, for new/grown alert detection
     const timerRef = useRef(null);
     const scanningR = useRef(false);
     const minCashR = useRef(minCash);
@@ -577,7 +610,8 @@ function App() {
                 return r;
             const pos = w.byCondition[r.conditionId];
             const endDate = (pos === null || pos === void 0 ? void 0 : pos.endDate) || null;
-            const hours = endDate && r.ts ? (endDate - r.ts) / 3600000 : null;
+            const anchor = r.wTs || r.ts; // dollar-weighted entry time
+            const hours = endDate && anchor ? (endDate - anchor) / 3600000 : null;
             const sig_time = scoreTiming(hours);
             const sig_wr = scoreWR(w.wins, w.resolved);
             const sig_dorm = scoreDorm(w.afterWin);
@@ -588,20 +622,21 @@ function App() {
             const maxParts = 24 + 12 + (sig_time !== null ? 22 : 0) + 6 + (sig_dorm !== null ? 7 : 0) + 8;
             return {
                 ...r, endDate, hours, sig_time, sig_wr, sig_dorm, sig_fresh,
-                w_wins: w.wins, w_resolved: w.resolved, w_pnl: w.pnl, w_open: w.open, w_total: w.total,
+                w_wins: w.wins, w_resolved: w.resolved, w_pnl: w.pnl, w_open: w.open, w_total: w.total, w_truncated: w.truncated,
                 sig_gambler,
                 fullScore: Math.max(0, parts.reduce((a, b) => a + b, 0) + (sig_gambler || 0)),
                 fullMax: maxParts,
                 enriched: true, enriching: false,
             };
         }));
-        if (posCache.current[item.addr]) {
-            apply(posCache.current[item.addr]);
+        const cached = posCache.current[item.addr];
+        if (cached && Date.now() - (cached.fetchedAt || 0) < POS_TTL_MS) {
+            apply(cached);
             return;
         }
         setFeed(prev => prev.map(r => r.id === item.id ? { ...r, enriching: true } : r));
         try {
-            const raw = await jFetch(`${DA}/positions?user=${item.addr}&limit=200`);
+            const raw = await jFetch(`${DA}/positions?user=${item.addr}&limit=${POS_LIMIT}`);
             const positions = Array.isArray(raw) ? raw.map(parsePosition) : [];
             const resolvedPos = positions.filter(p => p.redeemable);
             const wins = resolvedPos.filter(p => p.cashPnl > 0).length;
@@ -611,7 +646,12 @@ function App() {
             const byCondition = {};
             positions.forEach(p => { if (p.conditionId)
                 byCondition[p.conditionId] = p; });
-            const w = { wins, resolved: resolvedPos.length, pnl, open, afterWin, total: positions.length, byCondition };
+            // Truncation matters: past the page limit, win-rate / freshness / demotion
+            // are computed on PARTIAL history, and the traded market may be missing
+            // from byCondition (timing then fails open). Surfaced in the snapshot.
+            const truncated = positions.length >= POS_LIMIT;
+            const w = { wins, resolved: resolvedPos.length, pnl, open, afterWin,
+                total: positions.length, truncated, fetchedAt: Date.now(), byCondition };
             posCache.current[item.addr] = w;
             apply(w);
         }
@@ -687,26 +727,22 @@ function App() {
             // ── Path B (fallback / politics-off): direct data-api fetch, paginated
             // to the API's offset ceiling, de-duped by transaction hash.
             if (src !== "db") {
-                const PAGE = 500, TARGET = 2000;
+                // Pages fetched in PARALLEL (mirrors the collector). Past the API's
+                // offset ceiling pages come back empty or duplicated, which the
+                // id-dedup below absorbs — no sequential early-exit needed.
+                const PAGE = 500, OFFSETS = [0, 500, 1000, 1500];
+                const pages = await Promise.allSettled(OFFSETS.map(o => jFetch(`${DA}/trades?limit=${PAGE}&offset=${o}&takerOnly=true`)));
                 const raw = [];
                 const seenTx = new Set();
-                for (let offset = 0; offset < TARGET; offset += PAGE) {
-                    const page = await jFetch(`${DA}/trades?limit=${PAGE}&offset=${offset}&takerOnly=true`);
-                    if (!Array.isArray(page) || page.length === 0)
-                        break;
-                    let added = 0;
+                for (const res of pages) {
+                    const page = res.status === "fulfilled" && Array.isArray(res.value) ? res.value : [];
                     for (const t of page) {
                         const key = t.transactionHash || `${t.proxyWallet}-${t.conditionId}-${t.timestamp}`;
                         if (!seenTx.has(key)) {
                             seenTx.add(key);
                             raw.push(t);
-                            added++;
                         }
                     }
-                    if (page.length < PAGE)
-                        break; // reached the end of available trades
-                    if (added === 0)
-                        break; // offset not advancing → stop
                 }
                 if (!raw.length)
                     throw new Error("No trades returned from data-api.");
@@ -741,18 +777,21 @@ function App() {
             const deduped = [...clustered]
                 .sort((a, b) => b.cash - a.cash)
                 .sort((a, b) => b.quickScore - a.quickScore);
-            const fresh = new Set(deduped.filter(t => !prevIds.current.has(t.id)).map(t => t.id));
-            prevIds.current = new Set(deduped.map(t => t.id));
-            setNewIds(fresh);
+            const { fresh, grown } = diffPositions(deduped, prevPos.current);
+            const switched = prevModeR.current !== "live";
+            prevPos.current = new Map(deduped.map(t => [t.id, t.cash]));
+            prevModeR.current = "live";
+            setNewIds(switched ? new Set() : new Set([...fresh, ...grown]));
             setFeed(deduped);
             setLastUpd(new Date());
-            prevModeR.current = "live";
             // Enrich EVERY flagged row (chunked; wallet cache dedups) so the
             // resolution-window filter has an endDate for each market.
             setPhase("enrich");
             await enrichAll(deduped);
-            // Bell only for trades that SURVIVE the resolution window (silent if none).
-            if (soundOnR.current && deduped.some(t => inWindowNow(t)))
+            // Bell only for NEW or materially GROWN positions that survive the
+            // resolution window — never for the same trade sitting in the DB window.
+            if (soundOnR.current && !switched &&
+                deduped.some(t => (fresh.has(t.id) || grown.has(t.id)) && inWindowNow(t)))
                 playBell();
             setPhase("done");
         }
@@ -812,18 +851,19 @@ function App() {
             const deduped = [...clustered]
                 .sort((a, b) => b.cash - a.cash)
                 .sort((a, b) => b.quickScore - a.quickScore);
-            const fresh = new Set(deduped.filter(t => !prevIds.current.has(t.id)).map(t => t.id));
+            const { fresh, grown } = diffPositions(deduped, prevPos.current);
             const switched = prevModeR.current !== "history";
             prevModeR.current = "history";
-            prevIds.current = new Set(deduped.map(t => t.id));
-            setNewIds(switched ? new Set() : fresh);
+            prevPos.current = new Map(deduped.map(t => [t.id, t.cash]));
+            setNewIds(switched ? new Set() : new Set([...fresh, ...grown]));
             setFeed(deduped);
             setLastUpd(new Date());
             setPhase("enrich");
             await enrichAll(deduped);
             // History bell: only for NEW arrivals that survive the resolution window
             // (not on first load / mode switch — history always has rows).
-            if (soundOnR.current && !switched && deduped.some(t => fresh.has(t.id) && inWindowNow(t)))
+            if (soundOnR.current && !switched &&
+                deduped.some(t => (fresh.has(t.id) || grown.has(t.id)) && inWindowNow(t)))
                 playBell();
             setPhase("done");
         }
@@ -1025,7 +1065,7 @@ function App() {
                 React.createElement("div", { style: { padding: "12px 18px", borderTop: `1px solid ${T.bdr}` } },
                     React.createElement("span", { style: { fontSize: 10, color: T.dim, lineHeight: 1.85 } },
                         sorted.length,
-                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots) \u00B7 shown bands default to <10% and 60\u201375% (10\u201360% and 75%+ hidden) \u00B7 Timing/Win-Rate/Dormancy/Freshness fill in from each wallet's /positions (Freshness = visible lifetime positions, a proxy \u2014 confirm age on-chain) \u00B7 wallets with 0 wins in 10+ resolved take a serial-gambler score penalty (\u221210 to \u221225) \u00B7 Multi-Wallet Cluster = distinct wallets \u2265 min-cash entering the same side within 6h, auto-scored \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Resolution window hides markets resolving >30 days out or already resolved (unknown dates stay) \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
+                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots) \u00B7 shown bands default to <10% and 60\u201375% (10\u201360% and 75%+ hidden) \u00B7 Timing/Win-Rate/Dormancy/Freshness fill in from each wallet's /positions (Freshness = visible lifetime positions, a proxy \u2014 confirm age on-chain) \u00B7 wallets with 0 wins in 10+ resolved take a serial-gambler score penalty (\u221210 to \u221225) \u00B7 Multi-Wallet Cluster = distinct wallets \u2265 min-cash entering the same side within 6h, auto-scored \u00B7 TIMING is scored from the DOLLAR-WEIGHTED entry time across a position's fills (not the first fill) \u00B7 the bell rings only for NEW or +25%-grown positions \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Resolution window hides markets resolving >30 days out or already resolved (unknown dates stay) \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
 
