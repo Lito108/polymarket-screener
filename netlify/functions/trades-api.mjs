@@ -24,6 +24,34 @@ export default async (req) => {
   const url = new URL(req.url);
   const store = getStore("trades");
 
+  // ── Counts mode: wallet -> how many DISTINCT markets it has qualifying
+  // positions in, across the retention window. A wallet that shows up in 30
+  // different markets a month is running a strategy; a wallet that shows up
+  // once, near expiry, on a geopolitical longshot is the anomaly. Returns a
+  // tiny map, so the UI can cheaply demote systematic traders.
+  if (url.searchParams.get("counts")) {
+    const cdays = Math.min(30, Math.max(1, parseInt(url.searchParams.get("days") || "30", 10) || 30));
+    const seen = new Map();
+    for (let i = 0; i < cdays; i++) {
+      const d = new Date(Date.now() - i * 86_400_000).toISOString().slice(0, 10);
+      try {
+        const bucket = await store.get(`day/${d}`, { type: "json" });
+        if (!Array.isArray(bucket)) continue;
+        for (const t of bucket) {
+          if ((t.side || "BUY") !== "BUY" || !t.addr || !t.conditionId) continue;
+          let set = seen.get(t.addr);
+          if (!set) { set = new Set(); seen.set(t.addr, set); }
+          set.add(`${t.conditionId}|${(t.outcome || "").toLowerCase()}`);
+        }
+      } catch { /* missing day = fine */ }
+    }
+    const counts = {};
+    for (const [addr, set] of seen) counts[addr] = set.size;
+    return new Response(JSON.stringify({ days: cdays, wallets: Object.keys(counts).length, counts }), {
+      headers: { ...CORS, "Content-Type": "application/json", "Cache-Control": "no-store" },
+    });
+  }
+
   // ── Minutes window (LIVE mode): trades from the last N minutes only. ──
   const minutesParam = url.searchParams.get("minutes");
   if (minutesParam) {
