@@ -213,6 +213,100 @@ function attachClusters(items) {
         return { ...t, clusterN, sig_cluster: scoreCluster(clusterN) };
     });
 }
+// ── Exits (round-trips) ───────────────────────────────────────────────────────
+// The collector now stores SELLs too, so we can see a wallet MONETIZE and
+// leave. "Bought a longshot at 4c, sold at 45c two days before resolution" is
+// stronger evidence than the entry alone: it shows they were right AND took
+// the money. Scored only when a meaningful slice was sold at a real gain.
+const scoreExit = (frac, mult) => {
+    if (!(frac >= 0.2))
+        return 0; // trimming a token amount tells you nothing
+    if (mult >= 3)
+        return 12;
+    if (mult >= 2)
+        return 9;
+    if (mult >= 1.5)
+        return 5;
+    if (mult >= 1.2)
+        return 2;
+    return 0; // sold flat or at a loss
+};
+function attachExits(positions, sells) {
+    const byKey = new Map();
+    for (const x of sells) {
+        const k = `${x.addr}|${x.conditionId}|${(x.outcome || "").toLowerCase()}`;
+        let e = byKey.get(k);
+        if (!e) {
+            e = { cash: 0, shares: 0, fills: 0, lastTs: null };
+            byKey.set(k, e);
+        }
+        e.cash += x.cash;
+        e.shares += x.shares;
+        e.fills += 1;
+        if (x.ts && (!e.lastTs || x.ts > e.lastTs))
+            e.lastTs = x.ts;
+    }
+    return positions.map(p => {
+        const e = byKey.get(p.id);
+        if (!e || !(e.shares > 0))
+            return { ...p, sig_exit: null };
+        const exitPrice = e.cash / e.shares;
+        const exitFrac = p.shares > 0 ? Math.min(1, e.shares / p.shares) : 0;
+        const exitGain = p.price > 0 ? exitPrice / p.price : 0;
+        return {
+            ...p,
+            exitCash: e.cash, exitShares: e.shares, exitFills: e.fills, exitTs: e.lastTs,
+            exitPrice, exitFrac, exitGain,
+            exitRealized: e.cash - e.shares * p.price,
+            holdHours: (e.lastTs && p.wTs) ? (e.lastTs - p.wTs) / 3600000 : null,
+            sig_exit: scoreExit(exitFrac, exitGain),
+        };
+    });
+}
+// One composer for the full score, so enrichment and the post-enrichment
+// cluster rescore can never drift apart.
+function composeScore(sig, gambler) {
+    const parts = [sig.odds, sig.cluster, sig.exit, sig.time, sig.wr, sig.dorm, sig.fresh]
+        .filter(x => x !== null && x !== undefined);
+    const max = 24 + 12 + (sig.exit != null ? 12 : 0) + (sig.time != null ? 22 : 0)
+        + 6 + (sig.dorm != null ? 7 : 0) + 8;
+    return { total: Math.max(0, parts.reduce((a, b) => a + b, 0) + (gambler || 0)), max };
+}
+// ── Cluster re-scoring on wallet freshness ────────────────────────────────────
+// Raw same-side bursts measure POPULARITY on heavily-traded markets (nine
+// wallets buying consensus "Fed holds" is an efficient market, not a
+// conspiracy). Once enrichment lands, we re-score the cluster counting only
+// FRESH members — coordination between new wallets is the signal worth points.
+const FRESH_CLUSTER_MAX = 10; // "fresh" member = <= this many visible lifetime positions
+function rescoreClustersWithFreshness(rows, cache) {
+    const groups = new Map();
+    for (const t of rows) {
+        const k = `${t.conditionId}|${(t.outcome || "").toLowerCase()}`;
+        if (!groups.has(k))
+            groups.set(k, []);
+        groups.get(k).push(t);
+    }
+    return rows.map(t => {
+        const g = groups.get(`${t.conditionId}|${(t.outcome || "").toLowerCase()}`) || [t];
+        const my = t.ts ? t.ts.getTime() : 0;
+        const members = my ? g.filter(o => o.ts && Math.abs(o.ts.getTime() - my) <= CLUSTER_WINDOW_MS) : g;
+        const clusterFreshN = members.filter(o => {
+            const w = cache[o.addr];
+            return w && typeof w.total === "number" && w.total <= FRESH_CLUSTER_MAX;
+        }).length;
+        const sig_cluster = scoreCluster(clusterFreshN);
+        const { total, max } = composeScore({
+            odds: t.sig_odds, cluster: sig_cluster, exit: t.sig_exit,
+            time: t.sig_time, wr: t.sig_wr, dorm: t.sig_dorm, fresh: t.sig_fresh,
+        }, t.sig_gambler);
+        return {
+            ...t, clusterFreshN, sig_cluster,
+            quickScore: t.sig_odds + sig_cluster + (t.sig_exit || 0),
+            fullScore: t.enriched ? total : null,
+            fullMax: t.enriched ? max : null,
+        };
+    });
+}
 const scoreDorm = a => {
     if (a === null || a === undefined)
         return null;
@@ -269,28 +363,35 @@ const parsePosition = r => {
         endDate: tsToDate(r.endDate),
     });
 };
-// ── Political / geopolitical allowlist ─────────────────────────────────────────
+// filters.mjs — SINGLE SOURCE OF TRUTH for market classification.
+//
+// This file is consumed two ways, so the rules can never drift apart again:
+//   • collector.mjs imports it directly (Netlify bundles the relative import).
+//   • index.html gets it INJECTED at build time, replacing the __FILTERS__
+//     marker in insider-screener-feed.jsx. Never hand-edit the copy in
+//     index.html — edit here and recompile.
+//
 // Insider trading needs non-public info about a deterministic outcome. That
-// concentrates in politics, governance, geopolitics, legal/regulatory, corporate
-// actions, and macro data — NOT sports (outcome doesn't exist yet) or crypto
-// (resolves on public price feeds). Rather than blocklist the endless parade of
-// noise formats (meme markets, weather, social metrics…), we ALLOWLIST the
-// categories where insider patterns are possible. Matching is on the trade's own
-// `title` — no gamma call. Tuned against real feed titles + tracked markets.
+// concentrates in politics, governance, geopolitics, legal/regulatory,
+// corporate actions and macro — NOT sports (the outcome doesn't exist yet) or
+// crypto price markets (they resolve on public feeds).
 const GOV_RE = /\b(election|elected|electoral|president|presiden\w+|prime minister|mayor|mayoral|governor|gubernatorial|senator|senate|congress\w*|parliament\w*|chancellor|candidate|nominee|nominn?ation|nominated|primary|primaries|ballot|referendum|coalition|cabinet|incumbent|impeach\w*|inaugurat\w*|re-?elect\w*|GOP|republican|democrat|tory|tories|labour party|conservative party)\b/i;
 const OFFICE_RE = /\b(resign\w*|step down|steps down|stepping down|ousted?|out as|removed from office|leaves? office|leaving office|leaves? power|in power|remain in power|stay in power|seize power|hold office|approval rating|no[- ]confidence|vote of no confidence)\b/i;
 const GEO_RE = /\b(cease[- ]?fire|armistice|peace deal|peace talks|peace agreement|truce|sanction\w*|embargo|treaty|summit|NATO|united nations|G7|G20|nuclear|air ?strike|military strike|missile strike|missile|invasion|invade|coup|regime|overthrow|annex\w*|hostage|prisoner swap|strait of hormuz|hormuz|strait|drone strike|martial law|deploy troops|troops to|declares? war|go to war|war (before|by|with|breaks out)|strike (iran|israel|russia|china|north korea|ukraine|gaza|taiwan|syria))\b/i;
 const LEGAL_RE = /\b(SEC|FDA|FTC|DOJ|FBI|CIA|antitrust|indict\w*|convicted|verdict|ruling|supreme court|SCOTUS|lawsuit|subpoena|FISA|reauthoriz\w*|confirmed as|merger|acquisition|IPO|bankruptcy|delisting|recall|investigation|probe|CEO|fired as|sued?|pardon|executive order|extradit\w*|state of emergency)\b/i;
 const MACRO_RE = /\b(fed|FOMC|interest rate|rate (cut|hike|decision)|powell|inflation|CPI|recession|GDP|unemployment|jobs report|debt ceiling|shutdown|government shutdown|budget|tariff\w*|trade deal|debt default)\b/i;
-// Esports/sports veto: overrides the allowlist. A sports title containing an
-// allowlist keyword (tournament names, sponsor words) can otherwise leak
-// through — observed live with a Counter-Strike match. Narrow on purpose:
-// only unambiguous esports/series tokens, so political "X vs Y debate"
-// markets are never caught. KEEP IN SYNC in index.html and collector.mjs.
+// Esports/sports veto — overrides the allowlist. A sports title containing an
+// allowlist keyword can otherwise leak through: observed live with
+// "Counter-Strike: … BetBoom RUSH B! Summit Playoffs", where `summit` (there
+// for peace/NATO/G7 summits) matched. Narrow on purpose, so political
+// "X vs Y debate" markets are never caught.
 const DENY_RE = /\b(counter[- ]?strike|cs:?go|cs2|dota ?2|valorant|overwatch|rocket league|league of legends|esports|bo[1357])\b/i;
 const isRelevant = (title = "") => !DENY_RE.test(title) &&
     (GOV_RE.test(title) || OFFICE_RE.test(title) || GEO_RE.test(title) ||
         LEGAL_RE.test(title) || MACRO_RE.test(title));
+// ^ Build-time injection point. The allowlist + esports veto live in ONE file,
+// netlify/functions/filters.mjs, which the collector imports directly and the
+// build script splices in here. Never hand-edit the copy in index.html.
 // ── Alert bell (Web Audio — no asset needed) ───────────────────────────────────
 // A short bell "ding" played after a refresh when flagged trades are present.
 // Browsers block audio until the user interacts with the page, so unlockAudio()
@@ -415,9 +516,10 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                 React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, color: "#7FBEDB" } }, item.addr ? `${item.addr.slice(0, 6)}…${item.addr.slice(-4)}` : "—")),
             React.createElement("td", { style: { padding: "10px 8px" } },
                 React.createElement("div", { style: { fontSize: 11, color: T.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 260 } },
-                    item.clusterN >= 3 && (React.createElement("span", { style: { color: T.s, fontWeight: 700, marginRight: 5 }, title: `${item.clusterN} wallets entered this side within 6h` },
+                    item.clusterN >= 3 && (React.createElement("span", { style: { color: (item.sig_cluster || 0) > 0 ? T.s : T.dim, fontWeight: 700, marginRight: 5 }, title: `${item.clusterN} wallets entered this side within 6h${item.clusterFreshN != null ? ` · ${item.clusterFreshN} fresh` : ""}` },
                         "\u2691",
                         item.clusterN)),
+                    item.sig_exit > 0 && (React.createElement("span", { style: { color: T.ok, fontWeight: 700, marginRight: 5 }, title: `Sold ${(item.exitFrac * 100).toFixed(0)}% at ${item.exitGain.toFixed(2)}x entry` }, "\u2197")),
                     item.title || `${item.conditionId.slice(0, 28)}…`)),
             React.createElement("td", { style: { padding: "10px 8px" } },
                 React.createElement("span", { style: { fontFamily: T.mono, fontSize: 12, fontWeight: 700, color: isLowOdds ? T.s : T.a } },
@@ -467,10 +569,33 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                             "Last fill: ",
                             React.createElement("span", { style: { fontFamily: T.mono, color: T.s } }, item.lastTs.toLocaleString()),
                             React.createElement("span", { style: { color: T.dim } }, " \u00B7 timing scored on $-weighted entry"))),
+                        item.sig_exit != null && item.exitShares > 0 && (React.createElement("span", { style: { fontSize: 11, color: item.exitGain >= 1.2 ? T.ok : T.muted } },
+                            "\u2197 Exited ",
+                            (item.exitFrac * 100).toFixed(0),
+                            "% at avg",
+                            " ",
+                            React.createElement("span", { style: { fontFamily: T.mono } },
+                                (item.exitPrice * 100).toFixed(1),
+                                "%"),
+                            " ",
+                            "(",
+                            item.exitGain.toFixed(2),
+                            "\u00D7 entry, ",
+                            item.exitRealized >= 0 ? "+" : "",
+                            "$",
+                            Math.round(item.exitRealized).toLocaleString(),
+                            ")",
+                            item.holdHours != null && (React.createElement("span", { style: { color: T.dim } },
+                                " · held ",
+                                item.holdHours < 48 ? `${item.holdHours.toFixed(1)}h` : `${(item.holdHours / 24).toFixed(1)}d`)))),
                         item.clusterN >= 2 && (React.createElement("span", { style: { fontSize: 11, fontWeight: item.clusterN >= 3 ? 700 : 400, color: item.clusterN >= 3 ? T.s : T.muted } },
                             "\u2691 ",
                             item.clusterN,
-                            " wallets, same side, within 6h")),
+                            " wallets, same side, within 6h",
+                            item.clusterFreshN != null && (React.createElement("span", { style: { color: item.clusterFreshN >= 3 ? T.s : T.dim } },
+                                " · ",
+                                item.clusterFreshN,
+                                " fresh (scored)")))),
                         item.slug && (React.createElement("a", { href: `https://polymarket.com/event/${item.slug}`, target: "_blank", rel: "noopener noreferrer", style: { fontSize: 11, color: T.a, textDecoration: "none" } }, "Open on Polymarket \u2197")))),
                 React.createElement("div", { style: { display: "flex", gap: 28, flexWrap: "wrap" } },
                     React.createElement("div", { style: { minWidth: 250, flex: 1 } },
@@ -491,7 +616,8 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                         React.createElement(MiniBar, { label: "Post-Resolution Dormancy", tier: "A", pts: item.sig_dorm, max: 7, naText: item.enriching ? "enriching…" : "n/a" }),
                         React.createElement(MiniBar, { label: "Wallet Freshness", tier: "A", pts: item.sig_fresh, max: 8, naText: item.enriching ? "enriching…" : "n/a" }),
                         React.createElement(MiniBar, { label: "Wallet Age (WC\u00B7TX)", tier: "A", pts: null, max: 10, naText: "manual \u2193" }),
-                        React.createElement(MiniBar, { label: "Multi-Wallet Cluster", tier: "A", pts: (_d = item.sig_cluster) !== null && _d !== void 0 ? _d : 0, max: 12 })),
+                        React.createElement(MiniBar, { label: "Multi-Wallet Cluster", tier: "A", pts: (_d = item.sig_cluster) !== null && _d !== void 0 ? _d : 0, max: 12 }),
+                        React.createElement(MiniBar, { label: "Profitable Exit (round-trip)", tier: "A", pts: item.sig_exit, max: 12, naText: "no exit seen" })),
                     React.createElement("div", { style: { minWidth: 180 } },
                         React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 11 } }, "WALLET SNAPSHOT"),
                         item.enriching && (React.createElement("div", { style: { fontSize: 10, color: T.a, display: "flex", gap: 6, alignItems: "center" } },
@@ -570,6 +696,7 @@ function App() {
     const [newIds, setNewIds] = useState(new Set());
     const [errMsg, setErrMsg] = useState("");
     const posCache = useRef({});
+    const marketEnd = useRef({}); // conditionId -> endDate, shared across ALL wallets
     const prevPos = useRef(new Map()); // id -> cash, for new/grown alert detection
     const timerRef = useRef(null);
     const scanningR = useRef(false);
@@ -608,8 +735,10 @@ function App() {
         const apply = (w) => setFeed(prev => prev.map(r => {
             if (r.id !== item.id)
                 return r;
+            // End-date ladder: this wallet's own positions → the shared cross-wallet
+            // cache (free) → whatever the targeted fetch below recovered.
             const pos = w.byCondition[r.conditionId];
-            const endDate = (pos === null || pos === void 0 ? void 0 : pos.endDate) || null;
+            const endDate = (pos === null || pos === void 0 ? void 0 : pos.endDate) || marketEnd.current[r.conditionId] || null;
             const anchor = r.wTs || r.ts; // dollar-weighted entry time
             const hours = endDate && anchor ? (endDate - anchor) / 3600000 : null;
             const sig_time = scoreTiming(hours);
@@ -617,15 +746,16 @@ function App() {
             const sig_dorm = scoreDorm(w.afterWin);
             const sig_fresh = scoreFresh(w.total);
             const sig_gambler = scoreGambler(w.wins, w.resolved); // 0 or NEGATIVE
-            const parts = [r.sig_odds, r.sig_cluster, sig_time, sig_wr, sig_dorm, sig_fresh]
-                .filter(x => x !== null && x !== undefined);
-            const maxParts = 24 + 12 + (sig_time !== null ? 22 : 0) + 6 + (sig_dorm !== null ? 7 : 0) + 8;
+            const { total: fullTotal, max: fullMaxOut } = composeScore({
+                odds: r.sig_odds, cluster: r.sig_cluster, exit: r.sig_exit,
+                time: sig_time, wr: sig_wr, dorm: sig_dorm, fresh: sig_fresh,
+            }, sig_gambler);
             return {
                 ...r, endDate, hours, sig_time, sig_wr, sig_dorm, sig_fresh,
                 w_wins: w.wins, w_resolved: w.resolved, w_pnl: w.pnl, w_open: w.open, w_total: w.total, w_truncated: w.truncated,
                 sig_gambler,
-                fullScore: Math.max(0, parts.reduce((a, b) => a + b, 0) + (sig_gambler || 0)),
-                fullMax: maxParts,
+                fullScore: fullTotal,
+                fullMax: fullMaxOut,
                 enriched: true, enriching: false,
             };
         }));
@@ -644,18 +774,40 @@ function App() {
             const open = positions.length - resolvedPos.length;
             const afterWin = resolvedPos.length > 0 ? open : null;
             const byCondition = {};
-            positions.forEach(p => { if (p.conditionId)
-                byCondition[p.conditionId] = p; });
+            positions.forEach(p => {
+                if (!p.conditionId)
+                    return;
+                byCondition[p.conditionId] = p;
+                if (p.endDate)
+                    marketEnd.current[p.conditionId] = p.endDate; // share across wallets
+            });
             // Truncation matters: past the page limit, win-rate / freshness / demotion
             // are computed on PARTIAL history, and the traded market may be missing
             // from byCondition (timing then fails open). Surfaced in the snapshot.
             const truncated = positions.length >= POS_LIMIT;
+            // Targeted recovery: when history is truncated AND the traded market fell
+            // off the page, one extra call for THAT market restores its end date (and
+            // therefore the timing signal). /positions supports a `market` filter of
+            // comma-separated condition IDs — verified against Polymarket's docs.
+            if (truncated && !byCondition[item.conditionId] && !marketEnd.current[item.conditionId]) {
+                try {
+                    const one = await jFetch(`${DA}/positions?user=${item.addr}&market=${item.conditionId}`);
+                    (Array.isArray(one) ? one.map(parsePosition) : []).forEach(p => {
+                        if (!p.conditionId)
+                            return;
+                        byCondition[p.conditionId] = p;
+                        if (p.endDate)
+                            marketEnd.current[p.conditionId] = p.endDate;
+                    });
+                }
+                catch ( /* recovery is best-effort; timing just stays unknown */_a) { /* recovery is best-effort; timing just stays unknown */ }
+            }
             const w = { wins, resolved: resolvedPos.length, pnl, open, afterWin,
                 total: positions.length, truncated, fetchedAt: Date.now(), byCondition };
             posCache.current[item.addr] = w;
             apply(w);
         }
-        catch (_a) {
+        catch (_b) {
             setFeed(prev => prev.map(r => r.id === item.id ? { ...r, enriching: false, enriched: false } : r));
         }
     }, []);
@@ -676,7 +828,7 @@ function App() {
         if (!ed) {
             const w = posCache.current[t.addr];
             const p = w && w.byCondition[t.conditionId];
-            ed = p && p.endDate ? p.endDate : null;
+            ed = (p && p.endDate) || marketEnd.current[t.conditionId] || null;
         }
         if (!ed)
             return true;
@@ -715,7 +867,7 @@ function App() {
                                 id: q.id, addr: q.addr || "", conditionId: q.conditionId || "",
                                 ts: q.ts ? new Date(q.ts * 1000) : null,
                                 price: q.price || 0, shares: q.shares || 0, cash: q.cash || 0,
-                                side: "BUY", outcome: q.outcome || "", title: q.title || "", slug: q.slug || "",
+                                side: (q.side || "BUY").toUpperCase(), outcome: q.outcome || "", title: q.title || "", slug: q.slug || "",
                             })).filter(t => t.addr && t.conditionId && t.cash > 0 && isRelevant(t.title));
                             pulled = typeof data.count === "number" ? data.count : kept.length;
                             src = "db";
@@ -746,18 +898,21 @@ function App() {
                 }
                 if (!raw.length)
                     throw new Error("No trades returned from data-api.");
-                const buys = raw.map(parseTrade).filter(t => t.side === "BUY" && t.addr && t.conditionId && t.cash > 0);
-                kept = politicsOnlyR.current ? buys.filter(t => isRelevant(t.title)) : buys;
-                offTopic = buys.length - kept.length;
+                const fills = raw.map(parseTrade).filter(t => (t.side === "BUY" || t.side === "SELL") && t.addr && t.conditionId && t.cash > 0);
+                kept = politicsOnlyR.current ? fills.filter(t => isRelevant(t.title)) : fills;
+                offTopic = fills.length - kept.length;
                 pulled = raw.length;
             }
             setLiveSrc(src);
             setPhase("scoring");
             setExcluded(offTopic);
             setFetched(pulled);
-            // Aggregate split fills into positions, THEN apply the min-cash gate so a
+            // Aggregate BUY fills into positions, THEN apply the min-cash gate so a
             // whale accumulating in small tranches is caught by summed size.
-            const positions = aggregatePositions(kept).filter(p => p.cash >= minCashR.current);
+            // SELLs are matched separately as exits (round-trips).
+            const buyFills = kept.filter(t => t.side !== "SELL");
+            const sellFills = kept.filter(t => t.side === "SELL");
+            const positions = attachExits(aggregatePositions(buyFills).filter(p => p.cash >= minCashR.current), sellFills);
             const scored = positions.map(t => {
                 const sig_odds = scoreOdds(t.price * 100);
                 return {
@@ -771,7 +926,9 @@ function App() {
             // Burst-cluster detection runs BEFORE the odds-band filter, so wallets in
             // hidden bands still count toward a coordinated same-side entry.
             const clustered = attachClusters(scored).map(t => ({
-                ...t, quickScore: t.sig_odds + t.sig_cluster, quickMax: 36,
+                ...t,
+                quickScore: t.sig_odds + t.sig_cluster + (t.sig_exit || 0),
+                quickMax: 36 + (t.sig_exit != null ? 12 : 0),
             })).filter(t => inOddsBand(t.price * 100, oddsBandR.current));
             // Positions are already unique per wallet×market×outcome; just sort.
             const deduped = [...clustered]
@@ -788,6 +945,8 @@ function App() {
             // resolution-window filter has an endDate for each market.
             setPhase("enrich");
             await enrichAll(deduped);
+            // Freshness is known now — re-score bursts counting only fresh members.
+            setFeed(prev => rescoreClustersWithFreshness(prev, posCache.current));
             // Bell only for NEW or materially GROWN positions that survive the
             // resolution window — never for the same trade sitting in the DB window.
             if (soundOnR.current && !switched &&
@@ -827,12 +986,14 @@ function App() {
                 id: q.id, addr: q.addr || "", conditionId: q.conditionId || "",
                 ts: q.ts ? new Date(q.ts * 1000) : null,
                 price: q.price || 0, shares: q.shares || 0, cash: q.cash || 0,
-                side: "BUY", outcome: q.outcome || "", title: q.title || "", slug: q.slug || "",
+                side: (q.side || "BUY").toUpperCase(), outcome: q.outcome || "", title: q.title || "", slug: q.slug || "",
             })).filter(t => t.addr && t.conditionId && t.cash > 0 && isRelevant(t.title));
             setFetched(recs.length);
             setExcluded(0);
-            // Aggregate split fills into positions, then gate on summed size.
-            const positions = aggregatePositions(trades).filter(p => p.cash >= minCashR.current);
+            // Aggregate BUY fills into positions, gate on summed size, then match SELLs.
+            const buyFills = trades.filter(t => t.side !== "SELL");
+            const sellFills = trades.filter(t => t.side === "SELL");
+            const positions = attachExits(aggregatePositions(buyFills).filter(p => p.cash >= minCashR.current), sellFills);
             const scored = positions.map(t => {
                 const sig_odds = scoreOdds(t.price * 100);
                 return {
@@ -846,7 +1007,9 @@ function App() {
             // Burst-cluster detection runs BEFORE the odds-band filter, so wallets in
             // hidden bands still count toward a coordinated same-side entry.
             const clustered = attachClusters(scored).map(t => ({
-                ...t, quickScore: t.sig_odds + t.sig_cluster, quickMax: 36,
+                ...t,
+                quickScore: t.sig_odds + t.sig_cluster + (t.sig_exit || 0),
+                quickMax: 36 + (t.sig_exit != null ? 12 : 0),
             })).filter(t => inOddsBand(t.price * 100, oddsBandR.current));
             const deduped = [...clustered]
                 .sort((a, b) => b.cash - a.cash)
@@ -860,6 +1023,8 @@ function App() {
             setLastUpd(new Date());
             setPhase("enrich");
             await enrichAll(deduped);
+            // Freshness is known now — re-score bursts counting only fresh members.
+            setFeed(prev => rescoreClustersWithFreshness(prev, posCache.current));
             // History bell: only for NEW arrivals that survive the resolution window
             // (not on first load / mode switch — history always has rows).
             if (soundOnR.current && !switched &&
@@ -1065,7 +1230,7 @@ function App() {
                 React.createElement("div", { style: { padding: "12px 18px", borderTop: `1px solid ${T.bdr}` } },
                     React.createElement("span", { style: { fontSize: 10, color: T.dim, lineHeight: 1.85 } },
                         sorted.length,
-                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots) \u00B7 shown bands default to <10% and 60\u201375% (10\u201360% and 75%+ hidden) \u00B7 Timing/Win-Rate/Dormancy/Freshness fill in from each wallet's /positions (Freshness = visible lifetime positions, a proxy \u2014 confirm age on-chain) \u00B7 wallets with 0 wins in 10+ resolved take a serial-gambler score penalty (\u221210 to \u221225) \u00B7 Multi-Wallet Cluster = distinct wallets \u2265 min-cash entering the same side within 6h, auto-scored \u00B7 TIMING is scored from the DOLLAR-WEIGHTED entry time across a position's fills (not the first fill) \u00B7 the bell rings only for NEW or +25%-grown positions \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Resolution window hides markets resolving >30 days out or already resolved (unknown dates stay) \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
+                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots) \u00B7 shown bands default to <10% and 60\u201375% (10\u201360% and 75%+ hidden) \u00B7 Timing/Win-Rate/Dormancy/Freshness fill in from each wallet's /positions (Freshness = visible lifetime positions, a proxy \u2014 confirm age on-chain) \u00B7 wallets with 0 wins in 10+ resolved take a serial-gambler score penalty (\u221210 to \u221225) \u00B7 Multi-Wallet Cluster = distinct wallets \u2265 min-cash entering the same side within 6h, auto-scored \u00B7 TIMING is scored from the DOLLAR-WEIGHTED entry time across a position's fills (not the first fill) \u00B7 the bell rings only for NEW or +25%-grown positions \u00B7 SELLs are collected too: \u2197 marks a realized round-trip (Profitable Exit, 0\u201312) \u00B7 Multi-Wallet Cluster is re-scored after enrichment counting only FRESH members (\u226410 lifetime positions), so consensus crowds on busy markets stop earning points \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Resolution window hides markets resolving >30 days out or already resolved (unknown dates stay) \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
 
