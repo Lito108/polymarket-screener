@@ -22,7 +22,8 @@ const { useState, useEffect, useCallback, useRef } = React;
 // ════════════════════════════════════════════════════════════════════════════
 const DA = "https://data-api.polymarket.com";
 const POS_LIMIT = 500; // /positions page size; >= this means truncated history
-const POS_TTL_MS = 30 * 60000; // wallet stats go stale in a long-lived session — refetch after 30 min
+const POS_TTL_MS = 30 * 60000;
+const COUNTS_TTL_MS = 15 * 60000; // wallet-activity map refresh interval     // wallet stats go stale in a long-lived session — refetch after 30 min
 const LIVE_WINDOW_MIN = 15; // LIVE mode shows the last N minutes from our own DB
 const T = {
     bg: "#07080F", panel: "#0C1120", bdr: "#1E2B3D", text: "#F4F8FD",
@@ -191,6 +192,37 @@ const scoreFresh = total => {
         return 2;
     return 0;
 };
+// ── Market families ──────────────────────────────────────────────────────────
+// Rolling markets on one topic ("ceasefire continues through July 29 / 30 / 31")
+// are separate conditionIds, so a wallet — or a group — working the same theme
+// across consecutive expiries was invisible to cluster detection. Normalising
+// the trailing date out of the title groups the series back together. Only
+// TRAILING dates are stripped, so "win Michigan" and "win Kent County" stay
+// distinct families.
+const MONTHS_RE = "january|february|march|april|may|june|july|august|september|october|november|december";
+const familyKey = (title = "") => title.toLowerCase()
+    .replace(/\?+\s*$/, "")
+    .replace(new RegExp(`\\b(${MONTHS_RE})\\s+\\d{1,2}(st|nd|rd|th)?(,?\\s*\\d{4})?\\s*$`), "")
+    .replace(/\b\d{4}-\d{2}-\d{2}\s*$/, "")
+    .replace(/\bq[1-4]\s*\d{4}\s*$/, "")
+    .replace(/\b(by|through|on|before|in|until)\s*$/, "")
+    .trim();
+// ── Repeat-flag demotion ─────────────────────────────────────────────────────
+// Appearing in the flagged set again and again across DIFFERENT markets is the
+// signature of a systematic tail-buying strategy, not an information edge.
+// Orthogonal to the gambler demotion: a wallet can be both profitable and
+// systematic. Counts come from our own 30-day database.
+const scoreRepeat = n => {
+    if (n === null || n === undefined)
+        return null;
+    if (n >= 20)
+        return -12;
+    if (n >= 10)
+        return -8;
+    if (n >= 5)
+        return -4;
+    return 0;
+};
 // Multi-wallet burst: N distinct wallets (each above the min-cash gate)
 // entering the SAME market, SAME side, within CLUSTER_WINDOW of each other.
 // Burst-in-time is what separates coordination from mere market popularity.
@@ -199,13 +231,13 @@ const scoreCluster = n => (n >= 5 ? 12 : n >= 4 ? 9 : n >= 3 ? 6 : 0);
 function attachClusters(items) {
     const groups = new Map();
     for (const t of items) {
-        const k = `${t.conditionId}|${(t.outcome || "").toLowerCase()}`;
+        const k = `${familyKey(t.title)}|${(t.outcome || "").toLowerCase()}`;
         if (!groups.has(k))
             groups.set(k, []);
         groups.get(k).push(t);
     }
     return items.map(t => {
-        const g = groups.get(`${t.conditionId}|${(t.outcome || "").toLowerCase()}`) || [t];
+        const g = groups.get(`${familyKey(t.title)}|${(t.outcome || "").toLowerCase()}`) || [t];
         const my = t.ts ? t.ts.getTime() : 0;
         const clusterN = my
             ? g.filter(o => o.ts && Math.abs(o.ts.getTime() - my) <= CLUSTER_WINDOW_MS).length
@@ -265,12 +297,13 @@ function attachExits(positions, sells) {
 }
 // One composer for the full score, so enrichment and the post-enrichment
 // cluster rescore can never drift apart.
-function composeScore(sig, gambler) {
+function composeScore(sig, gambler, repeat) {
     const parts = [sig.odds, sig.cluster, sig.exit, sig.time, sig.wr, sig.dorm, sig.fresh]
         .filter(x => x !== null && x !== undefined);
     const max = 24 + 12 + (sig.exit != null ? 12 : 0) + (sig.time != null ? 22 : 0)
         + 6 + (sig.dorm != null ? 7 : 0) + 8;
-    return { total: Math.max(0, parts.reduce((a, b) => a + b, 0) + (gambler || 0)), max };
+    const penalties = (gambler || 0) + (repeat || 0);
+    return { total: Math.max(0, parts.reduce((a, b) => a + b, 0) + penalties), max };
 }
 // ── Cluster re-scoring on wallet freshness ────────────────────────────────────
 // Raw same-side bursts measure POPULARITY on heavily-traded markets (nine
@@ -281,13 +314,13 @@ const FRESH_CLUSTER_MAX = 10; // "fresh" member = <= this many visible lifetime 
 function rescoreClustersWithFreshness(rows, cache) {
     const groups = new Map();
     for (const t of rows) {
-        const k = `${t.conditionId}|${(t.outcome || "").toLowerCase()}`;
+        const k = `${familyKey(t.title)}|${(t.outcome || "").toLowerCase()}`;
         if (!groups.has(k))
             groups.set(k, []);
         groups.get(k).push(t);
     }
     return rows.map(t => {
-        const g = groups.get(`${t.conditionId}|${(t.outcome || "").toLowerCase()}`) || [t];
+        const g = groups.get(`${familyKey(t.title)}|${(t.outcome || "").toLowerCase()}`) || [t];
         const my = t.ts ? t.ts.getTime() : 0;
         const members = my ? g.filter(o => o.ts && Math.abs(o.ts.getTime() - my) <= CLUSTER_WINDOW_MS) : g;
         const clusterFreshN = members.filter(o => {
@@ -298,10 +331,10 @@ function rescoreClustersWithFreshness(rows, cache) {
         const { total, max } = composeScore({
             odds: t.sig_odds, cluster: sig_cluster, exit: t.sig_exit,
             time: t.sig_time, wr: t.sig_wr, dorm: t.sig_dorm, fresh: t.sig_fresh,
-        }, t.sig_gambler);
+        }, t.sig_gambler, t.sig_repeat);
         return {
             ...t, clusterFreshN, sig_cluster,
-            quickScore: t.sig_odds + sig_cluster + (t.sig_exit || 0),
+            quickScore: Math.max(0, t.sig_odds + sig_cluster + (t.sig_exit || 0) + (t.sig_repeat || 0)),
             fullScore: t.enriched ? total : null,
             fullMax: t.enriched ? max : null,
         };
@@ -353,6 +386,19 @@ const parseTrade = r => {
         title: r.title || "",
         slug: r.slug || r.eventSlug || "",
     };
+};
+// /closed-positions returns SETTLED positions — the half of a wallet's history
+// that /positions silently omits once a market is redeemed. Without it, a
+// 64-day-old account that has cashed out everything looks brand new.
+const parseClosedPosition = r => {
+    var _a;
+    return ({
+        conditionId: r.conditionId || "",
+        realizedPnl: parseFloat((_a = r.realizedPnl) !== null && _a !== void 0 ? _a : 0),
+        endDate: tsToDate(r.endDate),
+        closedAt: tsToDate(r.timestamp),
+        title: r.title || "",
+    });
 };
 const parsePosition = r => {
     var _a;
@@ -483,7 +529,7 @@ function MiniBar({ label, tier, pts, max, naText }) {
                     background: pts > 0 ? `linear-gradient(90deg,${tc}55,${tc})` : "#16243A", transition: "width .5s ease" } }))));
 }
 function FeedRow({ item, isNew, expanded, onToggle }) {
-    var _a, _b, _c, _d, _e, _f, _g;
+    var _a, _b, _c, _d, _e, _f, _g, _h;
     const score = (_a = item.fullScore) !== null && _a !== void 0 ? _a : item.quickScore;
     const maxScore = (_b = item.fullMax) !== null && _b !== void 0 ? _b : item.quickMax;
     const rk = getR(score);
@@ -519,6 +565,11 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                     item.clusterN >= 3 && (React.createElement("span", { style: { color: (item.sig_cluster || 0) > 0 ? T.s : T.dim, fontWeight: 700, marginRight: 5 }, title: `${item.clusterN} wallets entered this side within 6h${item.clusterFreshN != null ? ` · ${item.clusterFreshN} fresh` : ""}` },
                         "\u2691",
                         item.clusterN)),
+                    item.mktResolved && (React.createElement("span", { style: { fontSize: 8, fontWeight: 700, marginRight: 5, padding: "1px 4px", borderRadius: 3,
+                            color: item.mktWon ? "#08301A" : "#3A0D0D",
+                            background: item.mktWon ? T.ok : "#F87171" } }, item.mktWon ? "RESOLVED ✓ WON" : "RESOLVED ✗ LOST")),
+                    item.mktAwaiting && (React.createElement("span", { style: { fontSize: 8, fontWeight: 700, marginRight: 5, padding: "1px 4px", borderRadius: 3,
+                            color: "#3A2A00", background: "#F5C518" } }, "AWAITING RESOLUTION")),
                     item.sig_exit > 0 && (React.createElement("span", { style: { color: T.ok, fontWeight: 700, marginRight: 5 }, title: `Sold ${(item.exitFrac * 100).toFixed(0)}% at ${item.exitGain.toFixed(2)}x entry` }, "\u2197")),
                     item.title || `${item.conditionId.slice(0, 28)}…`)),
             React.createElement("td", { style: { padding: "10px 8px" } },
@@ -591,7 +642,7 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                         item.clusterN >= 2 && (React.createElement("span", { style: { fontSize: 11, fontWeight: item.clusterN >= 3 ? 700 : 400, color: item.clusterN >= 3 ? T.s : T.muted } },
                             "\u2691 ",
                             item.clusterN,
-                            " wallets, same side, within 6h",
+                            " wallets, same side of this market family, within 6h",
                             item.clusterFreshN != null && (React.createElement("span", { style: { color: item.clusterFreshN >= 3 ? T.s : T.dim } },
                                 " · ",
                                 item.clusterFreshN,
@@ -607,6 +658,12 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                         React.createElement("div", { style: { height: 1, background: T.bdr, margin: "9px 0" } }),
                         React.createElement("div", { style: { fontSize: 8, color: T.a, letterSpacing: 1.5, fontWeight: 700, background: `${T.a}10`, padding: "2px 6px", borderRadius: 3, display: "inline-block", marginBottom: 9 } }, "A-TIER"),
                         React.createElement(MiniBar, { label: "Historical Win Rate", tier: "A", pts: item.sig_wr, max: 6, naText: item.enriching ? "enriching…" : "<3 resolved" }),
+                        item.sig_repeat != null && item.sig_repeat < 0 && (React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 9, padding: "5px 9px", background: "rgba(255,59,59,.07)", border: "1px solid rgba(255,59,59,.22)", borderRadius: 4 } },
+                            React.createElement("span", { style: { fontSize: 11, color: "#FF8A8A" } },
+                                "Repeat-flag demotion \u2014 flagged in ",
+                                item.repeatN,
+                                " markets / 30d (systematic, not situational)"),
+                            React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, fontWeight: 700, color: "#FF6B6B" } }, item.sig_repeat))),
                         item.sig_gambler != null && item.sig_gambler < 0 && (React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 9, padding: "5px 9px", background: "rgba(255,59,59,.07)", border: "1px solid rgba(255,59,59,.22)", borderRadius: 4 } },
                             React.createElement("span", { style: { fontSize: 11, color: "#FF8A8A" } },
                                 "Serial-gambler demotion \u2014 0 wins in ",
@@ -631,6 +688,8 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                             ["Mkt resolves", item.endDate ? item.endDate.toLocaleDateString() : "—"],
                             ["Open positions", (_g = item.w_open) !== null && _g !== void 0 ? _g : "—"],
                             ["Lifetime positions", item.w_total != null ? (item.w_truncated ? `${item.w_total}+ partial` : item.w_total) : "—"],
+                            ["Open / settled", item.w_openCount != null ? `${item.w_openCount} / ${item.w_closedCount}` : "—"],
+                            ["Flagged markets 30d", (_h = item.repeatN) !== null && _h !== void 0 ? _h : "—"],
                         ].map(([k, v]) => (React.createElement("div", { key: k },
                             React.createElement("div", { style: { fontSize: 9, color: T.dim, marginBottom: 2 } }, k),
                             React.createElement("div", { style: { fontSize: 11, fontFamily: T.mono,
@@ -660,7 +719,7 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                             " the Polygonscan header \"Contract Creator \u2026 N ago\" is the account's birth. Created right before this bet = fresh burner.",
                             React.createElement("br", null),
                             React.createElement("span", { style: { color: "#4C94C4" } }, "\u25CF Multi-Wallet:"),
-                            " the same-side burst is auto-scored above; on-chain, confirm a shared FUNDER. Ignore matching \"contract creator\" \u2014 that is Polymarket's factory on every wallet."))))))));
+                            " the same-side burst is auto-scored above; on-chain, confirm a shared FUNDER. Proxies are deployed by several different Polymarket factory addresses, so a SHARED \"contract creator\" between two flagged wallets is weak evidence \u2014 not proof, not nothing."))))))));
 }
 function Steps({ phase }) {
     const LIST = [
@@ -697,6 +756,7 @@ function App() {
     const [errMsg, setErrMsg] = useState("");
     const posCache = useRef({});
     const marketEnd = useRef({}); // conditionId -> endDate, shared across ALL wallets
+    const walletCounts = useRef({ at: 0, data: {} }); // addr -> distinct markets flagged / 30d
     const prevPos = useRef(new Map()); // id -> cash, for new/grown alert detection
     const timerRef = useRef(null);
     const scanningR = useRef(false);
@@ -738,7 +798,21 @@ function App() {
             // End-date ladder: this wallet's own positions → the shared cross-wallet
             // cache (free) → whatever the targeted fetch below recovered.
             const pos = w.byCondition[r.conditionId];
-            const endDate = (pos === null || pos === void 0 ? void 0 : pos.endDate) || marketEnd.current[r.conditionId] || null;
+            const closed = w.closedByCondition ? w.closedByCondition[r.conditionId] : null;
+            const endDate = (pos === null || pos === void 0 ? void 0 : pos.endDate) || (closed === null || closed === void 0 ? void 0 : closed.endDate) || marketEnd.current[r.conditionId] || null;
+            // Market state. A settled market is the MOST interesting moment for a
+            // flagged trade, so it gets an outcome badge — and is never hidden.
+            let mktResolved = false, mktWon = null;
+            if (closed) {
+                mktResolved = true;
+                mktWon = closed.realizedPnl > 0;
+            }
+            else if (pos && pos.redeemable) {
+                mktResolved = true;
+                mktWon = true;
+            }
+            // Polymarket's endDate is the SCHEDULED close; settlement lags behind it.
+            const mktAwaiting = !mktResolved && !!endDate && endDate.getTime() <= Date.now();
             const anchor = r.wTs || r.ts; // dollar-weighted entry time
             const hours = endDate && anchor ? (endDate - anchor) / 3600000 : null;
             const sig_time = scoreTiming(hours);
@@ -749,9 +823,11 @@ function App() {
             const { total: fullTotal, max: fullMaxOut } = composeScore({
                 odds: r.sig_odds, cluster: r.sig_cluster, exit: r.sig_exit,
                 time: sig_time, wr: sig_wr, dorm: sig_dorm, fresh: sig_fresh,
-            }, sig_gambler);
+            }, sig_gambler, r.sig_repeat);
             return {
                 ...r, endDate, hours, sig_time, sig_wr, sig_dorm, sig_fresh,
+                mktResolved, mktWon, mktAwaiting,
+                w_openCount: w.openCount, w_closedCount: w.closedCount,
                 w_wins: w.wins, w_resolved: w.resolved, w_pnl: w.pnl, w_open: w.open, w_total: w.total, w_truncated: w.truncated,
                 sig_gambler,
                 fullScore: fullTotal,
@@ -766,14 +842,27 @@ function App() {
         }
         setFeed(prev => prev.map(r => r.id === item.id ? { ...r, enriching: true } : r));
         try {
-            const raw = await jFetch(`${DA}/positions?user=${item.addr}&limit=${POS_LIMIT}`);
-            const positions = Array.isArray(raw) ? raw.map(parsePosition) : [];
-            const resolvedPos = positions.filter(p => p.redeemable);
-            const wins = resolvedPos.filter(p => p.cashPnl > 0).length;
-            const pnl = positions.reduce((a, p) => a + (p.cashPnl || 0), 0);
-            const open = positions.length - resolvedPos.length;
-            const afterWin = resolvedPos.length > 0 ? open : null;
-            const byCondition = {};
+            // Open AND settled history, fetched together. /positions alone shows only
+            // what a wallet still HOLDS, so freshness / win-rate / the gambler
+            // demotion were all reading a truncated view of reality.
+            const [openRes, closedRes] = await Promise.allSettled([
+                jFetch(`${DA}/positions?user=${item.addr}&limit=${POS_LIMIT}`),
+                jFetch(`${DA}/closed-positions?user=${item.addr}&limit=${POS_LIMIT}`),
+            ]);
+            const positions = openRes.status === "fulfilled" && Array.isArray(openRes.value)
+                ? openRes.value.map(parsePosition) : [];
+            const closedPositions = closedRes.status === "fulfilled" && Array.isArray(closedRes.value)
+                ? closedRes.value.map(parseClosedPosition) : [];
+            // Settled = closed out + still-held-but-redeemable (won, unclaimed).
+            const redeemables = positions.filter(p => p.redeemable);
+            const resolvedCount = closedPositions.length + redeemables.length;
+            const wins = closedPositions.filter(p => p.realizedPnl > 0).length
+                + redeemables.filter(p => p.cashPnl > 0).length;
+            const pnl = positions.reduce((a, p) => a + (p.cashPnl || 0), 0)
+                + closedPositions.reduce((a, p) => a + (p.realizedPnl || 0), 0);
+            const open = positions.length - redeemables.length;
+            const afterWin = resolvedCount > 0 ? open : null;
+            const byCondition = {}, closedByCondition = {};
             positions.forEach(p => {
                 if (!p.conditionId)
                     return;
@@ -781,29 +870,51 @@ function App() {
                 if (p.endDate)
                     marketEnd.current[p.conditionId] = p.endDate; // share across wallets
             });
+            closedPositions.forEach(p => {
+                if (!p.conditionId)
+                    return;
+                closedByCondition[p.conditionId] = p;
+                if (p.endDate)
+                    marketEnd.current[p.conditionId] = p.endDate;
+            });
             // Truncation matters: past the page limit, win-rate / freshness / demotion
             // are computed on PARTIAL history, and the traded market may be missing
             // from byCondition (timing then fails open). Surfaced in the snapshot.
-            const truncated = positions.length >= POS_LIMIT;
+            const truncated = positions.length >= POS_LIMIT || closedPositions.length >= POS_LIMIT;
             // Targeted recovery: when history is truncated AND the traded market fell
             // off the page, one extra call for THAT market restores its end date (and
             // therefore the timing signal). /positions supports a `market` filter of
             // comma-separated condition IDs — verified against Polymarket's docs.
-            if (truncated && !byCondition[item.conditionId] && !marketEnd.current[item.conditionId]) {
+            if (truncated && !byCondition[item.conditionId] && !closedByCondition[item.conditionId]
+                && !marketEnd.current[item.conditionId]) {
                 try {
-                    const one = await jFetch(`${DA}/positions?user=${item.addr}&market=${item.conditionId}`);
-                    (Array.isArray(one) ? one.map(parsePosition) : []).forEach(p => {
-                        if (!p.conditionId)
-                            return;
-                        byCondition[p.conditionId] = p;
-                        if (p.endDate)
-                            marketEnd.current[p.conditionId] = p.endDate;
-                    });
+                    const [o, c] = await Promise.allSettled([
+                        jFetch(`${DA}/positions?user=${item.addr}&market=${item.conditionId}`),
+                        jFetch(`${DA}/closed-positions?user=${item.addr}&market=${item.conditionId}`),
+                    ]);
+                    if (o.status === "fulfilled" && Array.isArray(o.value))
+                        o.value.map(parsePosition).forEach(p => {
+                            if (!p.conditionId)
+                                return;
+                            byCondition[p.conditionId] = p;
+                            if (p.endDate)
+                                marketEnd.current[p.conditionId] = p.endDate;
+                        });
+                    if (c.status === "fulfilled" && Array.isArray(c.value))
+                        c.value.map(parseClosedPosition).forEach(p => {
+                            if (!p.conditionId)
+                                return;
+                            closedByCondition[p.conditionId] = p;
+                            if (p.endDate)
+                                marketEnd.current[p.conditionId] = p.endDate;
+                        });
                 }
                 catch ( /* recovery is best-effort; timing just stays unknown */_a) { /* recovery is best-effort; timing just stays unknown */ }
             }
-            const w = { wins, resolved: resolvedPos.length, pnl, open, afterWin,
-                total: positions.length, truncated, fetchedAt: Date.now(), byCondition };
+            const w = { wins, resolved: resolvedCount, pnl, open, afterWin,
+                total: positions.length + closedPositions.length, // TRUE lifetime
+                openCount: positions.length, closedCount: closedPositions.length,
+                truncated, fetchedAt: Date.now(), byCondition, closedByCondition };
             posCache.current[item.addr] = w;
             apply(w);
         }
@@ -832,9 +943,23 @@ function App() {
         }
         if (!ed)
             return true;
-        const ms = ed.getTime() - Date.now();
-        return ms > 0 && ms <= 2592000000;
+        return ed.getTime() - Date.now() <= 2592000000;
     };
+    // How many distinct markets has each wallet been flagged in over 30 days?
+    // Cheap map from our own database; cached, and failure is non-fatal.
+    const loadWalletCounts = useCallback(async () => {
+        if (Date.now() - walletCounts.current.at < COUNTS_TTL_MS)
+            return walletCounts.current.data;
+        try {
+            const r = await fetch("/api/trades?counts=1&days=30", { headers: { Accept: "application/json" } });
+            if (r.ok) {
+                const d = await r.json();
+                walletCounts.current = { at: Date.now(), data: (d && d.counts) || {} };
+            }
+        }
+        catch ( /* keep whatever we had */_a) { /* keep whatever we had */ }
+        return walletCounts.current.data;
+    }, []);
     const scan = useCallback(async () => {
         if (scanningR.current)
             return;
@@ -912,7 +1037,12 @@ function App() {
             // SELLs are matched separately as exits (round-trips).
             const buyFills = kept.filter(t => t.side !== "SELL");
             const sellFills = kept.filter(t => t.side === "SELL");
-            const positions = attachExits(aggregatePositions(buyFills).filter(p => p.cash >= minCashR.current), sellFills);
+            const counts = await loadWalletCounts();
+            const positions = attachExits(aggregatePositions(buyFills).filter(p => p.cash >= minCashR.current), sellFills)
+                .map(p => {
+                const repeatN = counts[p.addr];
+                return { ...p, repeatN: repeatN !== null && repeatN !== void 0 ? repeatN : null, sig_repeat: scoreRepeat(repeatN !== null && repeatN !== void 0 ? repeatN : null) };
+            });
             const scored = positions.map(t => {
                 const sig_odds = scoreOdds(t.price * 100);
                 return {
@@ -927,7 +1057,7 @@ function App() {
             // hidden bands still count toward a coordinated same-side entry.
             const clustered = attachClusters(scored).map(t => ({
                 ...t,
-                quickScore: t.sig_odds + t.sig_cluster + (t.sig_exit || 0),
+                quickScore: Math.max(0, t.sig_odds + t.sig_cluster + (t.sig_exit || 0) + (t.sig_repeat || 0)),
                 quickMax: 36 + (t.sig_exit != null ? 12 : 0),
             })).filter(t => inOddsBand(t.price * 100, oddsBandR.current));
             // Positions are already unique per wallet×market×outcome; just sort.
@@ -964,7 +1094,7 @@ function App() {
             setPhase("err");
         }
         scanningR.current = false;
-    }, [enrich, enrichAll]);
+    }, [enrich, enrichAll, loadWalletCounts]);
     // ── History scan: read from OUR database (collector → Netlify Blobs) ────────
     const scanHistory = useCallback(async () => {
         if (scanningR.current)
@@ -993,7 +1123,12 @@ function App() {
             // Aggregate BUY fills into positions, gate on summed size, then match SELLs.
             const buyFills = trades.filter(t => t.side !== "SELL");
             const sellFills = trades.filter(t => t.side === "SELL");
-            const positions = attachExits(aggregatePositions(buyFills).filter(p => p.cash >= minCashR.current), sellFills);
+            const counts = await loadWalletCounts();
+            const positions = attachExits(aggregatePositions(buyFills).filter(p => p.cash >= minCashR.current), sellFills)
+                .map(p => {
+                const repeatN = counts[p.addr];
+                return { ...p, repeatN: repeatN !== null && repeatN !== void 0 ? repeatN : null, sig_repeat: scoreRepeat(repeatN !== null && repeatN !== void 0 ? repeatN : null) };
+            });
             const scored = positions.map(t => {
                 const sig_odds = scoreOdds(t.price * 100);
                 return {
@@ -1008,7 +1143,7 @@ function App() {
             // hidden bands still count toward a coordinated same-side entry.
             const clustered = attachClusters(scored).map(t => ({
                 ...t,
-                quickScore: t.sig_odds + t.sig_cluster + (t.sig_exit || 0),
+                quickScore: Math.max(0, t.sig_odds + t.sig_cluster + (t.sig_exit || 0) + (t.sig_repeat || 0)),
                 quickMax: 36 + (t.sig_exit != null ? 12 : 0),
             })).filter(t => inOddsBand(t.price * 100, oddsBandR.current));
             const deduped = [...clustered]
@@ -1037,7 +1172,7 @@ function App() {
             setPhase("err");
         }
         scanningR.current = false;
-    }, [enrich, enrichAll]);
+    }, [enrich, enrichAll, loadWalletCounts]);
     // Dispatcher: SCAN NOW, auto-refresh, and mode switches all route through here.
     const runScan = useCallback(() => {
         return modeR.current === "history" ? scanHistory() : scan();
@@ -1054,13 +1189,15 @@ function App() {
     }, [autoRef, runScan]);
     // Resolution-window filter (display-time): hide markets resolving >30d out,
     // or already resolved; unknown dates stay visible.
+    // Resolution window. Hides only markets resolving FAR out. A market that has
+    // reached its scheduled close (awaiting settlement) or has actually settled is
+    // when a flagged trade matters MOST — those always stay on screen, badged.
     const visible = feed.filter(t => {
         if (!resolve30)
             return true;
         if (!t.endDate)
             return true;
-        const ms = t.endDate.getTime() - Date.now();
-        return ms > 0 && ms <= 2592000000;
+        return t.endDate.getTime() - Date.now() <= 2592000000;
     });
     const sorted = [...visible].sort((a, b) => {
         var _a, _b, _c, _d;
@@ -1230,7 +1367,7 @@ function App() {
                 React.createElement("div", { style: { padding: "12px 18px", borderTop: `1px solid ${T.bdr}` } },
                     React.createElement("span", { style: { fontSize: 10, color: T.dim, lineHeight: 1.85 } },
                         sorted.length,
-                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots) \u00B7 shown bands default to <10% and 60\u201375% (10\u201360% and 75%+ hidden) \u00B7 Timing/Win-Rate/Dormancy/Freshness fill in from each wallet's /positions (Freshness = visible lifetime positions, a proxy \u2014 confirm age on-chain) \u00B7 wallets with 0 wins in 10+ resolved take a serial-gambler score penalty (\u221210 to \u221225) \u00B7 Multi-Wallet Cluster = distinct wallets \u2265 min-cash entering the same side within 6h, auto-scored \u00B7 TIMING is scored from the DOLLAR-WEIGHTED entry time across a position's fills (not the first fill) \u00B7 the bell rings only for NEW or +25%-grown positions \u00B7 SELLs are collected too: \u2197 marks a realized round-trip (Profitable Exit, 0\u201312) \u00B7 Multi-Wallet Cluster is re-scored after enrichment counting only FRESH members (\u226410 lifetime positions), so consensus crowds on busy markets stop earning points \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 Resolution window hides markets resolving >30 days out or already resolved (unknown dates stay) \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
+                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots) \u00B7 shown bands default to <10% and 60\u201375% (10\u201360% and 75%+ hidden) \u00B7 Timing/Win-Rate/Dormancy/Freshness fill in from each wallet's /positions (Freshness = visible lifetime positions, a proxy \u2014 confirm age on-chain) \u00B7 wallets with 0 wins in 10+ resolved take a serial-gambler score penalty (\u221210 to \u221225) \u00B7 Multi-Wallet Cluster = distinct wallets \u2265 min-cash entering the same side of the same MARKET FAMILY (rolling expiries grouped) within 6h, auto-scored \u00B7 wallets flagged across 5/10/20+ markets in 30d take a repeat-flag demotion (\u22124/\u22128/\u221212) as systematic rather than situational \u00B7 TIMING is scored from the DOLLAR-WEIGHTED entry time across a position's fills (not the first fill) \u00B7 the bell rings only for NEW or +25%-grown positions \u00B7 SELLs are collected too: \u2197 marks a realized round-trip (Profitable Exit, 0\u201312) \u00B7 Multi-Wallet Cluster is re-scored after enrichment counting only FRESH members (\u226410 lifetime positions), so consensus crowds on busy markets stop earning points \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 wallet history spans /positions AND /closed-positions, so freshness, win rate and the gambler demotion count SETTLED bets too \u00B7 Resolution window hides only markets resolving >30 days out; markets past their scheduled close stay visible, badged AWAITING RESOLUTION or RESOLVED \u2713 WON / \u2717 LOST \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
 
