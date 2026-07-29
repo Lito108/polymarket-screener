@@ -399,6 +399,9 @@ const parseClosedPosition = r => {
     return ({
         conditionId: r.conditionId || "",
         realizedPnl: parseFloat((_a = r.realizedPnl) !== null && _a !== void 0 ? _a : 0),
+        curPrice: r.curPrice != null ? parseFloat(r.curPrice) : null,
+        outcome: r.outcome || "",
+        oppositeOutcome: r.oppositeOutcome || "",
         endDate: tsToDate(r.endDate),
         closedAt: tsToDate(r.timestamp),
         title: r.title || "",
@@ -409,7 +412,14 @@ const parsePosition = r => {
     return ({
         conditionId: r.conditionId || "",
         cashPnl: parseFloat((_a = r.cashPnl) !== null && _a !== void 0 ? _a : 0),
+        // MEASURED: a losing position can carry redeemable=true with curPrice=0 and a
+        // negative cashPnl. So `redeemable` means THE MARKET RESOLVED — not that this
+        // wallet won. Losers linger here unclaimed (nothing to claim); winners get
+        // redeemed and move to /closed-positions.
         redeemable: !!r.redeemable,
+        curPrice: r.curPrice != null ? parseFloat(r.curPrice) : null,
+        outcome: r.outcome || "",
+        oppositeOutcome: r.oppositeOutcome || "",
         endDate: tsToDate(r.endDate),
     });
 };
@@ -570,8 +580,8 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                         "\u2691",
                         item.clusterN)),
                     item.mktResolved && (React.createElement("span", { style: { fontSize: 8, fontWeight: 700, marginRight: 5, padding: "1px 4px", borderRadius: 3,
-                            color: item.mktWon ? "#08301A" : "#3A0D0D",
-                            background: item.mktWon ? T.ok : "#F87171" } }, item.mktWon ? "RESOLVED ✓ WON" : "RESOLVED ✗ LOST")),
+                            color: item.mktWon === true ? "#08301A" : item.mktWon === false ? "#3A0D0D" : "#0F1A26",
+                            background: item.mktWon === true ? T.ok : item.mktWon === false ? "#F87171" : "#94A3B8" } }, item.mktWon === true ? "RESOLVED ✓ WON" : item.mktWon === false ? "RESOLVED ✗ LOST" : "RESOLVED")),
                     item.mktAwaiting && (React.createElement("span", { style: { fontSize: 8, fontWeight: 700, marginRight: 5, padding: "1px 4px", borderRadius: 3,
                             color: "#3A2A00", background: "#F5C518" } }, "AWAITING RESOLUTION")),
                     item.sig_exit > 0 && (React.createElement("span", { style: { color: T.ok, fontWeight: 700, marginRight: 5 }, title: `Sold ${(item.exitFrac * 100).toFixed(0)}% at ${item.exitGain.toFixed(2)}x entry` }, "\u2197")),
@@ -760,6 +770,12 @@ function App() {
     const [errMsg, setErrMsg] = useState("");
     const posCache = useRef({});
     const marketEnd = useRef({}); // conditionId -> endDate, shared across ALL wallets
+    // conditionId -> { resolved, winner }. Settlement is a property of the MARKET,
+    // but the API only ever tells us about one wallet at a time — and a losing
+    // position drops off a profit-sorted page, which made badges flicker between
+    // RESOLVED and AWAITING. Whatever any wallet reveals is cached here for every
+    // row on that market, and never un-learned.
+    const marketRes = useRef({});
     const walletCounts = useRef({ at: 0, data: {} }); // addr -> distinct markets flagged / 30d
     const prevPos = useRef(new Map()); // id -> cash, for new/grown alert detection
     const timerRef = useRef(null);
@@ -807,13 +823,34 @@ function App() {
             // Market state. A settled market is the MOST interesting moment for a
             // flagged trade, so it gets an outcome badge — and is never hidden.
             let mktResolved = false, mktWon = null;
-            if (closed) {
+            // 1) Shared cache: one wallet's settlement resolves the whole cohort, and
+            //    because it is never un-learned, badges cannot flicker back to awaiting.
+            const shared = marketRes.current[r.conditionId];
+            if (shared && shared.resolved) {
                 mktResolved = true;
-                mktWon = closed.realizedPnl > 0;
+                if (shared.winner)
+                    mktWon = shared.winner.toLowerCase() === (r.outcome || "").toLowerCase();
             }
-            else if (pos && pos.redeemable) {
+            // 2) This wallet's own evidence, when the market side is unambiguous.
+            if (closed && closed.curPrice === 1) {
                 mktResolved = true;
                 mktWon = true;
+            }
+            else if (closed && closed.curPrice === 0) {
+                mktResolved = true;
+                mktWon = false;
+            }
+            else if (pos && pos.redeemable) {
+                // redeemable = the MARKET resolved. Won only if the position is worth
+                // something: curPrice pinned at 1, or a positive P&L.
+                mktResolved = true;
+                if (mktWon === null)
+                    mktWon = pos.curPrice === 1 ? true : pos.curPrice === 0 ? false : pos.cashPnl > 0;
+            }
+            // 3) Previously-known state survives a page that no longer lists it.
+            if (!mktResolved && r.mktResolved) {
+                mktResolved = true;
+                mktWon = r.mktWon;
             }
             // Polymarket's endDate is the SCHEDULED close; settlement lags behind it.
             const mktAwaiting = !mktResolved && !!endDate && endDate.getTime() <= Date.now();
@@ -904,6 +941,7 @@ function App() {
                 byCondition[p.conditionId] = p;
                 if (p.endDate)
                     marketEnd.current[p.conditionId] = p.endDate; // share across wallets
+                noteResolution(p);
             });
             closedPositions.forEach(p => {
                 if (!p.conditionId)
@@ -911,6 +949,7 @@ function App() {
                 closedByCondition[p.conditionId] = p;
                 if (p.endDate)
                     marketEnd.current[p.conditionId] = p.endDate;
+                noteResolution(p);
             });
             // Truncation matters: past the page limit, win-rate / freshness / demotion
             // are computed on PARTIAL history, and the traded market may be missing
@@ -996,6 +1035,25 @@ function App() {
         catch ( /* keep whatever we had */_a) { /* keep whatever we had */ }
         return walletCounts.current.data;
     }, []);
+    // Record what a position reveals about its MARKET's settlement.
+    // curPrice pinned at exactly 1 or 0 means settled (winner / loser);
+    // redeemable means settled regardless of which side this wallet held.
+    const noteResolution = (pos) => {
+        if (!pos || !pos.conditionId)
+            return;
+        const prev = marketRes.current[pos.conditionId] || { resolved: false, winner: null };
+        let resolved = prev.resolved, winner = prev.winner;
+        if (pos.redeemable === true || pos.curPrice === 1 || pos.curPrice === 0)
+            resolved = true;
+        if (!winner) {
+            if (pos.curPrice === 1 && pos.outcome)
+                winner = pos.outcome;
+            else if (pos.curPrice === 0 && pos.oppositeOutcome)
+                winner = pos.oppositeOutcome;
+        }
+        if (resolved)
+            marketRes.current[pos.conditionId] = { resolved, winner };
+    };
     const scan = useCallback(async () => {
         if (scanningR.current)
             return;
@@ -1403,7 +1461,7 @@ function App() {
                 React.createElement("div", { style: { padding: "12px 18px", borderTop: `1px solid ${T.bdr}` } },
                     React.createElement("span", { style: { fontSize: 10, color: T.dim, lineHeight: 1.85 } },
                         sorted.length,
-                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots) \u00B7 shown bands default to <10% and 60\u201375% (10\u201360% and 75%+ hidden) \u00B7 Timing/Win-Rate/Dormancy/Freshness fill in from each wallet's /positions (Freshness = visible lifetime positions, a proxy \u2014 confirm age on-chain) \u00B7 wallets with 0 wins in 10+ resolved take a serial-gambler score penalty (\u221210 to \u221225) \u00B7 Multi-Wallet Cluster = distinct wallets \u2265 min-cash entering the same side of the same MARKET FAMILY (rolling expiries grouped) within 6h, auto-scored \u00B7 wallets flagged across 5/10/20+ markets in 30d take a repeat-flag demotion (\u22124/\u22128/\u221212) as systematic rather than situational \u00B7 TIMING is scored from the DOLLAR-WEIGHTED entry time across a position's fills (not the first fill) \u00B7 the bell rings only for NEW or +25%-grown positions \u00B7 SELLs are collected too: \u2197 marks a realized round-trip (Profitable Exit, 0\u201312) \u00B7 Multi-Wallet Cluster is re-scored after enrichment counting only FRESH members (\u226410 lifetime positions), so consensus crowds on busy markets stop earning points \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 /closed-positions caps at 50 rows sorted by profit, so for heavy wallets a second ASC page is pulled; if the two pages overlap the history is COMPLETE, otherwise the win rate is withheld as \"sampled\" instead of reported as a flattering 100% \u00B7 wallet history spans /positions AND /closed-positions, so freshness, win rate and the gambler demotion count SETTLED bets too \u00B7 Resolution window hides only markets resolving >30 days out; markets past their scheduled close stay visible, badged AWAITING RESOLUTION or RESOLVED \u2713 WON / \u2717 LOST \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
+                        " flagged \u00B7 CASH = price \u00D7 shares (real dollar value) \u00B7 Pre-enrich score = Entry Odds (0\u201324, weighted toward longshots) \u00B7 shown bands default to <10% and 60\u201375% (10\u201360% and 75%+ hidden) \u00B7 Timing/Win-Rate/Dormancy/Freshness fill in from each wallet's /positions (Freshness = visible lifetime positions, a proxy \u2014 confirm age on-chain) \u00B7 wallets with 0 wins in 10+ resolved take a serial-gambler score penalty (\u221210 to \u221225) \u00B7 Multi-Wallet Cluster = distinct wallets \u2265 min-cash entering the same side of the same MARKET FAMILY (rolling expiries grouped) within 6h, auto-scored \u00B7 wallets flagged across 5/10/20+ markets in 30d take a repeat-flag demotion (\u22124/\u22128/\u221212) as systematic rather than situational \u00B7 TIMING is scored from the DOLLAR-WEIGHTED entry time across a position's fills (not the first fill) \u00B7 the bell rings only for NEW or +25%-grown positions \u00B7 SELLs are collected too: \u2197 marks a realized round-trip (Profitable Exit, 0\u201312) \u00B7 Multi-Wallet Cluster is re-scored after enrichment counting only FRESH members (\u226410 lifetime positions), so consensus crowds on busy markets stop earning points \u00B7 TIMING shows \"\u00B7\" before enrichment, \"\u2014\" if the market has no resolved end-date \u00B7 /closed-positions caps at 50 rows sorted by profit, so for heavy wallets a second ASC page is pulled; if the two pages overlap the history is COMPLETE, otherwise the win rate is withheld as \"sampled\" instead of reported as a flattering 100% \u00B7 wallet history spans /positions AND /closed-positions, so freshness, win rate and the gambler demotion count SETTLED bets too \u00B7 Resolution window hides only markets resolving >30 days out; markets past their scheduled close stay visible, badged AWAITING RESOLUTION or RESOLVED \u2713 WON / \u2717 LOST \u00B7 settlement is cached per MARKET, so one wallet's resolution badges every row on that market and a badge never reverts \u00B7 note redeemable=true means the MARKET resolved, not that the wallet won \u2014 losing shares sit unclaimed at curPrice 0 \u00B7 Privacy Bridge + Wallet Age + Multi-Wallet are manual (row links) \u00B7 Click any row to expand.")))))));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
 
