@@ -3,8 +3,11 @@
 // The always-on collector. Netlify runs this on a schedule (every 1 minute,
 // see `config` at the bottom) even when nobody has the screener open. Each run:
 //   1. pulls the most recent trades from Polymarket's data-api,
-//   2. keeps only trades matching the screener's insider-relevant defaults:
-//        BUY side · politics/geo allowlist · cash ≥ $500 · entry < 75%,
+//   2. keeps trades matching the screener's insider-relevant defaults:
+//        politics/geo allowlist · cash ≥ STORE_MIN_CASH, with
+//        BUYS capped at entry < 75% and SELLS kept at ANY price (an exit is
+//        high-priced by definition — round-trips are how you see an insider
+//        monetize and leave),
 //   3. appends the new ones (de-duplicated) into a per-day bucket in
 //      Netlify Blobs (the free key-value store acting as our database),
 //   4. prunes buckets older than RETAIN_DAYS,
@@ -13,6 +16,7 @@
 // The companion function trades-api.mjs serves this data back to the screener.
 
 import { getStore } from "@netlify/blobs";
+import { isRelevant } from "./filters.mjs";
 
 const DA = "https://data-api.polymarket.com";
 const STORE_MIN_CASH = 100; // dollars — low floor so split fills survive for aggregation
@@ -24,25 +28,8 @@ const OFFSETS = [0, 500, 1000, 1500];    // fetched IN PARALLEL — compute is b
                                          // literally cost fewer credits than sequential
 const RETAIN_DAYS = 30;    // history window kept in storage
 
-// ── Politics / geopolitics allowlist ──────────────────────────────────────────
-// KEEP IN SYNC with the same regexes in index.html. Insider trading needs
-// non-public info about a deterministic outcome — these categories are where
-// that is possible; sports/crypto/meme markets are not.
-const GOV_RE = /\b(election|elected|electoral|president|presiden\w+|prime minister|mayor|mayoral|governor|gubernatorial|senator|senate|congress\w*|parliament\w*|chancellor|candidate|nominee|nominn?ation|nominated|primary|primaries|ballot|referendum|coalition|cabinet|incumbent|impeach\w*|inaugurat\w*|re-?elect\w*|GOP|republican|democrat|tory|tories|labour party|conservative party)\b/i;
-const OFFICE_RE = /\b(resign\w*|step down|steps down|stepping down|ousted?|out as|removed from office|leaves? office|leaving office|leaves? power|in power|remain in power|stay in power|seize power|hold office|approval rating|no[- ]confidence|vote of no confidence)\b/i;
-const GEO_RE = /\b(cease[- ]?fire|armistice|peace deal|peace talks|peace agreement|truce|sanction\w*|embargo|treaty|summit|NATO|united nations|G7|G20|nuclear|air ?strike|military strike|missile strike|missile|invasion|invade|coup|regime|overthrow|annex\w*|hostage|prisoner swap|strait of hormuz|hormuz|strait|drone strike|martial law|deploy troops|troops to|declares? war|go to war|war (before|by|with|breaks out)|strike (iran|israel|russia|china|north korea|ukraine|gaza|taiwan|syria))\b/i;
-const LEGAL_RE = /\b(SEC|FDA|FTC|DOJ|FBI|CIA|antitrust|indict\w*|convicted|verdict|ruling|supreme court|SCOTUS|lawsuit|subpoena|FISA|reauthoriz\w*|confirmed as|merger|acquisition|IPO|bankruptcy|delisting|recall|investigation|probe|CEO|fired as|sued?|pardon|executive order|extradit\w*|state of emergency)\b/i;
-const MACRO_RE = /\b(fed|FOMC|interest rate|rate (cut|hike|decision)|powell|inflation|CPI|recession|GDP|unemployment|jobs report|debt ceiling|shutdown|government shutdown|budget|tariff\w*|trade deal|debt default)\b/i;
-// Esports/sports veto: overrides the allowlist. A sports title containing an
-// allowlist keyword (tournament names, sponsor words) can otherwise leak
-// through — observed live with a Counter-Strike match. Narrow on purpose:
-// only unambiguous esports/series tokens, so political "X vs Y debate"
-// markets are never caught. KEEP IN SYNC in index.html and collector.mjs.
-const DENY_RE = /\b(counter[- ]?strike|cs:?go|cs2|dota ?2|valorant|overwatch|rocket league|league of legends|esports|bo[1357])\b/i;
-const isRelevant = (title = "") =>
-  !DENY_RE.test(title) &&
-  (GOV_RE.test(title) || OFFICE_RE.test(title) || GEO_RE.test(title) ||
-   LEGAL_RE.test(title) || MACRO_RE.test(title));
+// Allowlist + veto now live in ONE place: ./filters.mjs, which the UI also
+// injects at build time. Never re-declare these rules here.
 
 // UTC day key for a unix-seconds timestamp, e.g. "2026-06-19"
 const dayKey = (tsSec) => new Date(tsSec * 1000).toISOString().slice(0, 10);
@@ -87,13 +74,18 @@ export default async () => {
       const price = parseFloat(r.price || 0);
       const shares = parseFloat(r.size || 0);
       const cash = price * shares;
-      if ((r.side || "").toUpperCase() !== "BUY") continue;
+      const side = (r.side || "").toUpperCase();
+      if (side !== "BUY" && side !== "SELL") continue;
       if (!r.proxyWallet || !r.conditionId) continue;
       if (cash < STORE_MIN_CASH) continue;
-      if (!(price > 0 && price < MAX_PRICE)) continue;
+      if (!(price > 0)) continue;
+      // Entry ceiling applies to BUYS only. A SELL at 80c is exactly the exit
+      // we want to see; filtering it out would hide every profitable round-trip.
+      if (side === "BUY" && price >= MAX_PRICE) continue;
       if (!isRelevant(r.title || "")) continue;
       qual.push({
-        id: r.transactionHash || `${r.proxyWallet}-${r.conditionId}-${r.timestamp}`,
+        id: r.transactionHash || `${r.proxyWallet}-${r.conditionId}-${r.timestamp}-${side}`,
+        side,
         addr: r.proxyWallet,
         conditionId: r.conditionId,
         ts: Number(r.timestamp) || 0,   // unix seconds
