@@ -6,6 +6,7 @@
 // first, plus the collector's meta/status so the UI can show freshness.
 
 import { getStore } from "@netlify/blobs";
+import { familyOf } from "./filters.mjs";
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -41,7 +42,11 @@ export default async (req) => {
           if ((t.side || "BUY") !== "BUY" || !t.addr || !t.conditionId) continue;
           let set = seen.get(t.addr);
           if (!set) { set = new Set(); seen.set(t.addr, set); }
-          set.add(`${t.conditionId}|${(t.outcome || "").toLowerCase()}`);
+          // Family, not conditionId: a wallet trading one rolling series 23x is a
+          // single-thesis trader, not a serial flag-generator. Falls back to the
+          // conditionId when a stored row has no title.
+          const fam = familyOf(t.title || "") || t.conditionId;
+          set.add(`${fam}|${(t.outcome || "").toLowerCase()}`);
         }
       } catch { /* missing day = fine */ }
     }
