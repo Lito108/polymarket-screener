@@ -2,7 +2,8 @@
 //
 // The always-on collector. Netlify runs this on a schedule (every 1 minute,
 // see `config` at the bottom) even when nobody has the screener open. Each run:
-//   1. pulls the most recent trades from Polymarket's data-api,
+//   1. pulls the most recent trades from Polymarket's data-api (v2; v1 was
+//      retired Oct 2026 and now answers 410 on every route),
 //   2. keeps trades matching the screener's insider-relevant defaults:
 //        politics/geo allowlist · cash ≥ STORE_MIN_CASH, with
 //        BUYS capped at entry < 75% and SELLS kept at ANY price (an exit is
@@ -22,10 +23,14 @@ const DA = "https://data-api.polymarket.com";
 const STORE_MIN_CASH = 100; // dollars — low floor so split fills survive for aggregation
                             // (the UI sums fills per wallet×market, then applies YOUR $500+ gate)
 const MAX_PRICE = 0.75;    // exclusive — entry odds must be BELOW 75%
-const PAGE = 500;                        // data-api caps /trades at 500 per request
-const OFFSETS = [0, 500, 1000, 1500];    // fetched IN PARALLEL — compute is billed on
-                                         // run DURATION (GB-hours), so parallel pages
-                                         // literally cost fewer credits than sequential
+const PAGE = 500;          // rows per request
+const MAX_PAGES = 4;       // same ~2000-row depth the old 4 x 500 offsets gave.
+                           // v2 paging is CURSOR-based, so pages must be walked
+                           // in sequence: page N carries the cursor for N+1.
+                           // `offset` is not merely ignored on v2, it is a 400.
+                           // Four sequential fetches cost ~1s of run duration;
+                           // measured compute for a whole billing period was
+                           // 1.4 credits, so the lost parallelism is noise.
 const RETAIN_DAYS = 30;    // history window kept in storage
 
 // Allowlist + veto now live in ONE place: ./filters.mjs, which the UI also
@@ -34,6 +39,14 @@ const RETAIN_DAYS = 30;    // history window kept in storage
 // UTC day key for a unix-seconds timestamp, e.g. "2026-06-19"
 const dayKey = (tsSec) => new Date(tsSec * 1000).toISOString().slice(0, 10);
 
+// v2 rows are snake_case (proxy_wallet); v1 rows were camelCase (proxyWallet).
+// Read both spellings so neither a partial rollback nor a stray v1 row can
+// silently zero out a field and drop the trade.
+const f = (r, snake, camel) => r[snake] ?? r[camel];
+const tradeKey = (t) =>
+  f(t, "transaction_hash", "transactionHash") ||
+  `${f(t, "proxy_wallet", "proxyWallet")}-${f(t, "condition_id", "conditionId")}-${t.timestamp}`;
+
 export default async () => {
   const store = getStore("trades");
   const startedAt = new Date().toISOString();
@@ -41,23 +54,37 @@ export default async () => {
   let spanSec = 0, oldestTs = 0, newestTs = 0;   // coverage telemetry (function-scoped: used in status write below)
 
   try {
-    // 1) Pull recent trades (paginated, de-duped, stop at API ceiling)
-    // All page offsets fired at once; the API ceiling just yields empty or
-    // duplicate pages past ~1.5k, which the id-dedup below absorbs harmlessly.
-    const results = await Promise.allSettled(OFFSETS.map(o =>
-      fetch(`${DA}/trades?limit=${PAGE}&offset=${o}&takerOnly=true`,
-        { headers: { Accept: "application/json" } }).then(r => (r.ok ? r.json() : []))
-    ));
+    // 1) Pull recent trades: walk the v2 cursor until MAX_PAGES or the feed
+    // runs out. The id-dedup below is kept even though cursors should not
+    // repeat a row — it costs nothing and absorbs any overlap at page seams
+    // while new trades land mid-walk.
     const raw = [];
     const seen = new Set();
-    for (const res of results) {
-      const page = res.status === "fulfilled" && Array.isArray(res.value) ? res.value : [];
-      for (const t of page) {
-        const k = t.transactionHash || `${t.proxyWallet}-${t.conditionId}-${t.timestamp}`;
+    let cursor = null;
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const qs = new URLSearchParams({ limit: String(PAGE), taker_only: "true" });
+      if (cursor) qs.set("cursor", cursor);
+      const res = await fetch(`${DA}/v2/trades?${qs}`, { headers: { Accept: "application/json" } });
+      if (!res.ok) {
+        // Surface the REAL status and body. The old code mapped every non-OK
+        // response to an empty page, so when v1 began answering 410 the whole
+        // outage presented as the generic "no trades on any page" — true, but
+        // it named neither the status nor the cause. Never swallow this again.
+        const body = await res.text().catch(() => "");
+        throw new Error(`GET /v2/trades page ${page} -> HTTP ${res.status} ${body.slice(0, 180)}`);
+      }
+      const json = await res.json();
+      // v2 wraps rows in { data, pagination }. A bare array means something
+      // other than v2 answered, so treat it as a page of rows and stop.
+      const rows = Array.isArray(json) ? json : (Array.isArray(json?.data) ? json.data : []);
+      for (const t of rows) {
+        const k = tradeKey(t);
         if (!seen.has(k)) { seen.add(k); raw.push(t); }
       }
+      cursor = json?.pagination?.next_cursor || null;
+      if (!rows.length || !cursor) break;
     }
-    if (!raw.length) throw new Error("data-api returned no trades on any page");
+    if (!raw.length) throw new Error("/v2/trades answered 200 with an empty data array");
     fetched = raw.length;
     // Coverage telemetry: how many seconds of trading did this fetch actually
     // span? If spanSec < the run interval (60s), the net has no gaps. If it is
@@ -75,8 +102,10 @@ export default async () => {
       const shares = parseFloat(r.size || 0);
       const cash = price * shares;
       const side = (r.side || "").toUpperCase();
+      const addr = f(r, "proxy_wallet", "proxyWallet");
+      const conditionId = f(r, "condition_id", "conditionId");
       if (side !== "BUY" && side !== "SELL") continue;
-      if (!r.proxyWallet || !r.conditionId) continue;
+      if (!addr || !conditionId) continue;
       if (cash < STORE_MIN_CASH) continue;
       if (!(price > 0)) continue;
       // Entry ceiling applies to BUYS only. A SELL at 80c is exactly the exit
@@ -84,17 +113,17 @@ export default async () => {
       if (side === "BUY" && price >= MAX_PRICE) continue;
       if (!isRelevant(r.title || "")) continue;
       qual.push({
-        id: r.transactionHash || `${r.proxyWallet}-${r.conditionId}-${r.timestamp}-${side}`,
+        id: f(r, "transaction_hash", "transactionHash") || `${addr}-${conditionId}-${r.timestamp}-${side}`,
         side,
-        addr: r.proxyWallet,
-        conditionId: r.conditionId,
+        addr,
+        conditionId,
         ts: Number(r.timestamp) || 0,   // unix seconds
         price,
         shares,
         cash: Math.round(cash * 100) / 100,
         outcome: r.outcome || "",
         title: r.title || "",
-        slug: r.slug || r.eventSlug || "",
+        slug: r.slug || f(r, "event_slug", "eventSlug") || "",
       });
     }
     kept = qual.length;
