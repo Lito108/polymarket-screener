@@ -5,7 +5,7 @@
 //   1. pulls the most recent trades from Polymarket's data-api (v2; v1 was
 //      retired Oct 2026 and now answers 410 on every route),
 //   2. keeps trades matching the screener's insider-relevant defaults:
-//        politics/geo allowlist · cash ≥ STORE_MIN_CASH, with
+//        economics/finance allowlist · cash ≥ STORE_MIN_CASH, with
 //        BUYS capped at entry < 75% and SELLS kept at ANY price (an exit is
 //        high-priced by definition — round-trips are how you see an insider
 //        monetize and leave),
@@ -122,6 +122,14 @@ export default async () => {
         shares,
         cash: Math.round(cash * 100) / 100,
         outcome: r.outcome || "",
+        // EVERY price-history route is keyed by token_id, never condition_id:
+        //   CLOB      /prices-history?market=<TOKEN_ID>   ("market" takes a token)
+        //   Data API  /v2/prices-history?token_id=<TOKEN_ID>
+        // Without this field a stored trade can never be checked against the
+        // price series of the thing it bought, so it is captured now even
+        // though nothing reads it yet. Trades collected without it are not
+        // recoverable later.
+        tokenId: f(r, "token_id", "asset") || "",
         title: r.title || "",
         slug: r.slug || f(r, "event_slug", "eventSlug") || "",
       });
