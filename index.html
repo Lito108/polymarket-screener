@@ -408,6 +408,7 @@ const parseTrade = r => {
         price, shares, cash: price * shares,
         side: (r.side || "BUY").toUpperCase(),
         outcome: r.outcome || "",
+        tokenId: g(r, "token_id", "asset") || "", // price-history key; see collector.mjs
         title: r.title || "",
         slug: r.slug || g(r, "event_slug", "eventSlug") || "",
     };
@@ -462,24 +463,73 @@ const parsePosition = r => {
 //     marker in insider-screener-feed.jsx. Never hand-edit the copy in
 //     index.html — edit here and recompile.
 //
-// Insider trading needs non-public info about a deterministic outcome. That
-// concentrates in politics, governance, geopolitics, legal/regulatory,
-// corporate actions and macro — NOT sports (the outcome doesn't exist yet) or
-// crypto price markets (they resolve on public feeds).
-const GOV_RE = /\b(election|elected|electoral|president|presiden\w+|prime minister|mayor|mayoral|governor|gubernatorial|senator|senate|congress\w*|parliament\w*|chancellor|candidate|nominee|nominn?ation|nominated|primary|primaries|ballot|referendum|coalition|cabinet|incumbent|impeach\w*|inaugurat\w*|re-?elect\w*|GOP|republican|democrat|tory|tories|labour party|conservative party)\b/i;
-const OFFICE_RE = /\b(resign\w*|step down|steps down|stepping down|ousted?|out as|removed from office|leaves? office|leaving office|leaves? power|in power|remain in power|stay in power|seize power|hold office|approval rating|no[- ]confidence|vote of no confidence)\b/i;
-const GEO_RE = /\b(cease[- ]?fire|armistice|peace deal|peace talks|peace agreement|truce|sanction\w*|embargo|treaty|summit|NATO|united nations|G7|G20|nuclear|air ?strike|military strike|missile strike|missile|invasion|invade|coup|regime|overthrow|annex\w*|hostage|prisoner swap|strait of hormuz|hormuz|strait|drone strike|martial law|deploy troops|troops to|declares? war|go to war|war (before|by|with|breaks out)|strike (iran|israel|russia|china|north korea|ukraine|gaza|taiwan|syria))\b/i;
-const LEGAL_RE = /\b(SEC|FDA|FTC|DOJ|FBI|CIA|antitrust|indict\w*|convicted|verdict|ruling|supreme court|SCOTUS|lawsuit|subpoena|FISA|reauthoriz\w*|confirmed as|merger|acquisition|IPO|bankruptcy|delisting|recall|investigation|probe|CEO|fired as|sued?|pardon|executive order|extradit\w*|state of emergency)\b/i;
-const MACRO_RE = /\b(fed|FOMC|interest rate|rate (cut|hike|decision)|powell|inflation|CPI|recession|GDP|unemployment|jobs report|debt ceiling|shutdown|government shutdown|budget|tariff\w*|trade deal|debt default)\b/i;
-// Esports/sports veto — overrides the allowlist. A sports title containing an
-// allowlist keyword can otherwise leak through: observed live with
-// "Counter-Strike: … BetBoom RUSH B! Summit Playoffs", where `summit` (there
-// for peace/NATO/G7 summits) matched. Narrow on purpose, so political
-// "X vs Y debate" markets are never caught.
-const DENY_RE = /\b(counter[- ]?strike|cs:?go|cs2|dota ?2|valorant|overwatch|rocket league|league of legends|esports|bo[1357])\b/i;
-const isRelevant = (title = "") => !DENY_RE.test(title) &&
-    (GOV_RE.test(title) || OFFICE_RE.test(title) || GEO_RE.test(title) ||
-        LEGAL_RE.test(title) || MACRO_RE.test(title));
+// SCOPE (changed Nov 2026): ECONOMICS AND FINANCE ONLY.
+// Elections, governance and geopolitics were removed — they used to be the
+// whole point, and that history is why so many GOV/GEO terms are conspicuously
+// absent rather than never written.
+//
+// The thesis is unchanged: insider trading needs non-public information about
+// a DETERMINISTIC outcome — a fact that already exists before it is public.
+// That is what the three allowlists below are sorted by, strongest first:
+//
+//   CORPORATE  M&A, IPOs, insolvency, executive changes. The classic insider
+//              domain: a deal is negotiated privately for weeks before it is
+//              announced. Strongest signal per flagged trade.
+//   REGFIN     Regulator decisions — approvals, enforcement, clearance. The
+//              decision exists inside the agency before the public sees it.
+//   MACRO      Economic data releases (CPI, payrolls, GDP) are pre-computed
+//              inside a statistical agency before publication, so they leak
+//              like corporate actions do. Rate DECISIONS are the weak member
+//              of this set: nothing exists to leak until the committee votes.
+//
+// Two vetoes override all three, for the same reason crypto price markets were
+// always excluded: a market that settles off a public feed has no private fact
+// to know. GAME_RE drops game outcomes; PRICE_RE drops asset-price thresholds
+// in any asset class — equities, metals, FX and crypto alike.
+
+// ── Allowlist 1: corporate actions ──────────────────────────────────────────
+// Executive-change verbs are deliberately bound to an executive TITLE. A bare
+// "resign" or "step down" would re-admit every political resignation market
+// this rewrite just removed.
+const CORPORATE_RE = /\b(merger|merges?|merging|acquisition|acquires?|acquired|acquiring|takeover|buyout|LBO|tender offer|spin[- ]?offs?|divests?|divestiture|sells? a stake|stake sale|sold for|goes? private|taken private|IPOs?|direct listing|SPACs?|public offering|bankrupt|bankruptcies|bankruptcy|chapter 11|insolven\w*|liquidation|delist\w*|restructur\w*|defaults? on|earnings|revenues?|profit warning|dividends?|buybacks?|share repurchase|layoffs?|job cuts|funding round|series [a-f] round|valuation)s?\b|\b(resigns?|resigned|steps? down|stepping down|ousted?|fired|named|appointed|succeeds?)\s+(as\s+)?(the\s+)?(CEO|CFO|COO|CTO|chair|chairman|chairwoman|chief executive)\b|\b(CEO|CFO|chief executive)\b/i;
+
+// ── Allowlist 2: financial & market regulators ──────────────────────────────
+// This is also where the crypto carve-out lives: a spot-ETF approval or a
+// stablecoin bill is a regulatory event with a private decision behind it, so
+// it is KEPT even though crypto price markets are vetoed below.
+const REGFIN_RE = /\b(SEC|FTC|DOJ|CFTC|FINRA|FDIC|OCC|CFPB|FHFA|FASB|PCAOB|IRS|FDA|EMA|FCC|CMA|European Commission|antitrust|monopol\w*|consent decree|cease and desist|securities fraud|insider trading|class action|merger review|regulatory approval|approval|clearance|ETFs?|stablecoin|market structure bill|price[- ]fixing|accounting fraud|restatement|short[- ]seller report)s?\b/i;
+
+// ── Allowlist 3: macro & economic policy ────────────────────────────────────
+const MACRO_RE = /\b(fed|FOMC|federal reserve|interest rates?|rate (cut|hike|decision|change|rise)|powell|central bank|monetary policy|basis points|bps|quantitative (easing|tightening)|inflation|CPI|PCE|PPI|deflation|stagflation|recession|GDP|unemployment|jobless|nonfarm|payrolls?|jobs report|labor market|retail sales|consumer confidence|ISM|PMI|housing starts|debt ceiling|government shut ?downs?|shutdowns?|OPEC\+?|oil production (cut|quota)|production quota|federal budget|budget deficit|deficit|fiscal (policy|year|cliff)|tariffs?|trade deal|trade war|trade agreement|debt default|credit rating|downgrades?|sovereign debt|yield curve|treasury yields?|stimulus|bailout|minimum wage|bank of (england|japan|korea|canada|mexico|israel|india|brazil|china)|ECB|BOJ|PBOC|BOE)s?\b/i;
+
+// ── Veto 1: game outcomes ───────────────────────────────────────────────────
+// Targets the SHAPE of a betting line, not league or team names — so that
+// "Will the NFL sell a stake to private equity?" survives as an M&A market
+// while "Guardians vs. Reds: O/U 8.5" does not. Naming leagues here would
+// have killed exactly the corporate deals this screener wants.
+const GAME_RE = /\b(vs\.?|versus)\b|\bO\/U\b|\bover\/under\b|\bspread:|\bmoneyline\b|\bby \d+\+? (points?|runs?|goals?|sets?)\b|\b(counter[- ]?strike|cs:?go|cs2|dota ?2|valorant|overwatch|rocket league|league of legends|esports|bo[1357])\b|\bwins? (the )?(match|game|series|title|cup|championship|final|grand prix|stage \d)\b|\bend in a draw\b/i;
+
+// ── Veto 2: asset price thresholds ──────────────────────────────────────────
+// A market that settles off a published price has no private fact to leak,
+// whatever the asset. Note what is NOT here: the word "over". "Sold for over
+// $5B" is an acquisition price, not a quote, and must stay in — which is also
+// why CORPORATE_RE outranks this veto in isRelevant() below.
+const INDEX_RE = /\b(S&P ?500|S&P|Dow( Jones)?|Nasdaq|FTSE|Nikkei|DAX|CAC|Russell \d+|VIX)\b[^?]*\b(above|below|close[sd]?|end[s]? (above|below)|reach\w*|hit[s]?|top[s]?)\b/i;
+const PRICE_RE = /\bup or down\b|\ball[- ]time high\b|\bATH\b|\b(reach|reaches|hit|hits|top|tops|exceed|exceeds|surpass|surpasses|touch|touches|dip|dips|fall|falls|drop|drops|rise|rises|close|closes|trade|trades)\s+(to\s+|at\s+|above\s+|below\s+)?\$[\d,.]+/i;
+
+// ── Decision ────────────────────────────────────────────────────────────────
+// Order matters:
+//   1. a game outcome is never in scope, whatever else the title says;
+//   2. a price threshold is out UNLESS the title is a corporate action —
+//      an acquisition price is a deal term, not a market quote;
+//   3. otherwise, any one of the three allowlists admits it.
+const isRelevant = (title = "") => {
+  if (!title) return false;
+  if (GAME_RE.test(title)) return false;
+  const corporate = CORPORATE_RE.test(title);
+  if (!corporate && (PRICE_RE.test(title) || INDEX_RE.test(title))) return false;
+  return corporate || REGFIN_RE.test(title) || MACRO_RE.test(title);
+};
 // ^ Build-time injection point. The allowlist + esports veto live in ONE file,
 // netlify/functions/filters.mjs, which the collector imports directly and the
 // build script splices in here. Never hand-edit the copy in index.html.
@@ -1397,9 +1447,9 @@ function App() {
                     React.createElement("button", { onClick: () => { unlockAudio(); if (!soundOn)
                             playBell(); setSoundOn(p => !p); }, style: { padding: "5px 12px", fontSize: 10, background: soundOn ? "rgba(111,205,248,.12)" : "transparent", border: `1px solid ${soundOn ? "rgba(111,205,248,.32)" : T.bdr}`, color: soundOn ? T.a : T.muted, borderRadius: 4, cursor: "pointer" } }, soundOn ? "ON · bell" : "OFF · muted")),
                 React.createElement("div", null,
-                    React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "POLITICS / GEO ONLY"),
+                    React.createElement("div", { style: { fontSize: 8, color: T.dim, letterSpacing: 2, fontWeight: 700, marginBottom: 6 } }, "ECONOMICS / FINANCE ONLY"),
                     React.createElement("button", { onClick: () => setExcludeNoise(p => !p), style: { padding: "5px 12px", fontSize: 10, background: excludeNoise ? "rgba(249,115,22,.12)" : "transparent", border: `1px solid ${excludeNoise ? "rgba(249,115,22,.32)" : T.bdr}`, color: excludeNoise ? T.s : T.muted, borderRadius: 4, cursor: "pointer" } }, excludeNoise ? "ON · allowlist" : "OFF · show all")),
-                React.createElement("div", { style: { fontSize: 10, color: T.dim, lineHeight: 1.7, marginLeft: "auto", maxWidth: 290 } }, "POLITICS/GEO ONLY surfaces only markets where insider info is possible: elections, appointments, resignations, sanctions, ceasefires, nuclear, courts/SEC/FDA/FBI, Fed/inflation. Sports, crypto, weather & meme markets are hidden. Flip OFF to see everything (LIVE only; uses the direct API feed). HISTORY reads your own database: politics \u00B7 fills \u2265$100 stored (your $500+ gate applies to the summed position) \u00B7 <75% \u00B7 collected every minute. LIVE reads the last 15 min of the same database (\u22641m lag) and falls back to the direct API if the collector is stale.")))),
+                React.createElement("div", { style: { fontSize: 10, color: T.dim, lineHeight: 1.7, marginLeft: "auto", maxWidth: 290 } }, "ECONOMICS/FINANCE ONLY surfaces only markets where a private fact exists before it is public: M&A, IPOs, bankruptcies, CEO changes, SEC/FTC/DOJ/FDA decisions, ETF approvals, and economic data (CPI, payrolls, GDP, Fed). Sports, elections, geopolitics and all asset-price markets — crypto, equities, metals, FX — are hidden. Flip OFF to see everything (LIVE only).")))),
         React.createElement("div", { style: { borderBottom: `1px solid ${T.bdr}`, padding: "7px 18px" } },
             React.createElement("div", { style: { maxWidth: 1240, margin: "0 auto", display: "flex", gap: 20, alignItems: "center", flexWrap: "wrap" } },
                 [
