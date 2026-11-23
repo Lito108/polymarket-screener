@@ -671,7 +671,7 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                         React.createElement(MiniBar, { label: "Privacy Bridge Origin", tier: "S", pts: null, max: 25, naText: "manual \u2193" }),
                         React.createElement("div", { style: { height: 1, background: T.bdr, margin: "9px 0" } }),
                         React.createElement("div", { style: { fontSize: 8, color: T.a, letterSpacing: 1.5, fontWeight: 700, background: `${T.a}10`, padding: "2px 6px", borderRadius: 3, display: "inline-block", marginBottom: 9 } }, "A-TIER"),
-                        React.createElement(MiniBar, { label: "Historical Win Rate", tier: "A", pts: item.sig_wr, max: 6, naText: item.enriching ? "enriching…" : item.w_sampled ? "history sampled — rate not computable" : "<3 resolved" }),
+                        React.createElement(MiniBar, { label: "Historical Win Rate", tier: "A", pts: item.sig_wr, max: 6, naText: item.enriching ? "enriching…" : item.w_histFail ? "wallet history unavailable" : item.w_sampled ? "history sampled — rate not computable" : "<3 resolved" }),
                         item.sig_repeat != null && item.sig_repeat < 0 && (React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 9, padding: "5px 9px", background: "rgba(255,59,59,.07)", border: "1px solid rgba(255,59,59,.22)", borderRadius: 4 } },
                             React.createElement("span", { style: { fontSize: 11, color: "#FF8A8A" } },
                                 "Repeat-flag demotion \u2014 flagged in ",
@@ -684,8 +684,8 @@ function FeedRow({ item, isNew, expanded, onToggle }) {
                                 item.w_resolved,
                                 " resolved"),
                             React.createElement("span", { style: { fontFamily: T.mono, fontSize: 11, fontWeight: 700, color: "#FF6B6B" } }, item.sig_gambler))),
-                        React.createElement(MiniBar, { label: "Post-Resolution Dormancy", tier: "A", pts: item.sig_dorm, max: 7, naText: item.enriching ? "enriching…" : "n/a" }),
-                        React.createElement(MiniBar, { label: "Wallet Freshness", tier: "A", pts: item.sig_fresh, max: 8, naText: item.enriching ? "enriching…" : "n/a" }),
+                        React.createElement(MiniBar, { label: "Post-Resolution Dormancy", tier: "A", pts: item.sig_dorm, max: 7, naText: item.enriching ? "enriching…" : item.w_histFail ? "wallet history unavailable" : "n/a" }),
+                        React.createElement(MiniBar, { label: "Wallet Freshness", tier: "A", pts: item.sig_fresh, max: 8, naText: item.enriching ? "enriching…" : item.w_histFail ? "wallet history unavailable" : "n/a" }),
                         React.createElement(MiniBar, { label: "Wallet Age (WC\u00B7TX)", tier: "A", pts: null, max: 10, naText: "manual \u2193" }),
                         React.createElement(MiniBar, { label: "Multi-Wallet Cluster", tier: "A", pts: (_d = item.sig_cluster) !== null && _d !== void 0 ? _d : 0, max: 12 }),
                         React.createElement(MiniBar, { label: "Profitable Exit (round-trip)", tier: "A", pts: item.sig_exit, max: 12, naText: "no exit seen" })),
@@ -869,7 +869,9 @@ function App() {
             return {
                 ...r, endDate, hours, sig_time, sig_wr, sig_dorm, sig_fresh,
                 mktResolved, mktWon, mktAwaiting,
-                w_openCount: w.openCount, w_closedCount: w.closedCount, w_sampled: w.closedComplete === false,
+                w_openCount: w.openCount, w_closedCount: w.closedCount,
+                w_histFail: w.histOk === false,
+                w_sampled: w.histOk !== false && w.closedComplete === false,
                 w_wins: w.wins, w_resolved: w.resolved, w_pnl: w.pnl, w_open: w.open, w_total: w.total, w_truncated: w.truncated,
                 sig_gambler,
                 fullScore: fullTotal,
@@ -891,15 +893,21 @@ function App() {
                 jFetch(`${DA}/positions?user=${item.addr}&limit=${POS_LIMIT}`),
                 jFetch(`${DA}/closed-positions?user=${item.addr}&limit=${CLOSED_PAGE_CAP}&sortDirection=DESC`),
             ]);
-            const positions = openRes.status === "fulfilled" && Array.isArray(openRes.value)
-                ? openRes.value.map(parsePosition) : [];
+            // DID the history actually arrive? An empty array and a failed call are
+            // NOT the same thing, and the difference is not cosmetic: w.total=0 feeds
+            // scoreFresh(0) = 8, the maximum "brand-new burner wallet" signal. So a
+            // dead positions endpoint silently awards every wallet the strongest
+            // freshness score there is. Withhold instead — the same way a sampled
+            // win rate is withheld rather than reported as a flattering fake.
+            const histOk = openRes.status === "fulfilled" && Array.isArray(openRes.value);
+            const positions = histOk ? openRes.value.map(parsePosition) : [];
             let closedPositions = closedRes.status === "fulfilled" && Array.isArray(closedRes.value)
                 ? closedRes.value.map(parseClosedPosition) : [];
             // If the best-50 page is full, the wallet has more settled history than one
             // page shows. Pull the WORST 50 as well: if the two pages overlap at all,
             // total settled <= 100 and we now hold the COMPLETE set. If they don't
             // overlap, history is genuinely sampled and any win RATE would be fiction.
-            let closedComplete = closedPositions.length < CLOSED_PAGE_CAP;
+            let closedComplete = histOk && closedPositions.length < CLOSED_PAGE_CAP;
             if (!closedComplete) {
                 try {
                     const worst = await jFetch(`${DA}/closed-positions?user=${item.addr}&limit=${CLOSED_PAGE_CAP}&sortDirection=ASC`);
@@ -985,9 +993,9 @@ function App() {
                 }
                 catch ( /* recovery is best-effort; timing just stays unknown */_b) { /* recovery is best-effort; timing just stays unknown */ }
             }
-            const w = { wins, resolved: resolvedCount, pnl, open, afterWin,
-                closedComplete,
-                total: positions.length + closedPositions.length, // TRUE lifetime
+            const w = { wins, resolved: histOk ? resolvedCount : null, pnl, open, afterWin,
+                closedComplete, histOk,
+                total: histOk ? positions.length + closedPositions.length : null, // TRUE lifetime
                 openCount: positions.length, closedCount: closedPositions.length,
                 truncated, fetchedAt: Date.now(), byCondition, closedByCondition };
             posCache.current[item.addr] = w;
