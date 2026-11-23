@@ -21,13 +21,16 @@ const { useState, useEffect, useCallback, useRef } = React;
 //  Privacy Bridge & Wallet Age need Polygonscan → remain manual (row links).
 // ════════════════════════════════════════════════════════════════════════════
 const DA = "https://data-api.polymarket.com";
-const POS_LIMIT = 500; // /positions page size; >= this means truncated history
+// POS_LIMIT / CLOSED_PAGE_CAP retired with v1: v2 pages by cursor to the true
+// end of a wallet's history, so completeness is reported by the pager
+// (jFetchAll -> complete) instead of inferred from a page being full.
 const POS_TTL_MS = 30 * 60000;
 const COUNTS_TTL_MS = 15 * 60000; // wallet-activity map refresh interval
-// MEASURED, not assumed: /closed-positions ignores limit>50 and sorts by
-// realizedPnl DESC. A single page is therefore a wallet's 50 BEST trades —
-// 100% winners by construction. Everything below exists to avoid believing it.
-const CLOSED_PAGE_CAP = 50; // wallet stats go stale in a long-lived session — refetch after 30 min
+// HISTORICAL (v1): /closed-positions ignored limit>50 and sorted by realizedPnl
+// DESC, so one page was a wallet's 50 BEST trades — 100% winners by
+// construction, and a mountain of code existed to avoid believing it. v2 pages
+// by cursor to the true end, so that whole hazard is gone.
+// wallet stats go stale in a long-lived session — refetch after 30 min
 const LIVE_WINDOW_MIN = 15; // LIVE mode shows the last N minutes from our own DB
 const T = {
     bg: "#07080F", panel: "#0C1120", bdr: "#1E2B3D", text: "#F4F8FD",
@@ -359,6 +362,24 @@ const jFetch = async (url) => {
         throw new Error(`HTTP ${r.status}`);
     return r.json();
 };
+// Every v2 read returns { data, pagination:{ has_more, next_cursor } }.
+// Walk the cursor to the end so a wallet's history is COMPLETE, not a page of
+// it. HARD_PAGE_CAP only stops a pathological wallet from hanging the UI; if
+// it ever trips we know the set is partial and say so, never guess.
+const V2_PAGE = 500, HARD_PAGE_CAP = 8;
+const jFetchAll = async (base, cap) => {
+    const out = [];
+    let cursor = null, complete = false;
+    for (let i = 0; i < (cap || HARD_PAGE_CAP); i++) {
+        const url = `${base}${base.includes("?") ? "&" : "?"}limit=${V2_PAGE}` + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
+        const j = await jFetch(url);
+        const rows = Array.isArray(j) ? j : (Array.isArray(j === null || j === void 0 ? void 0 : j.data) ? j.data : []);
+        out.push(...rows);
+        cursor = (j && j.pagination && j.pagination.next_cursor) || null;
+        if (!rows.length || !cursor) { complete = true; break; }
+    }
+    return { rows: out, complete };
+};
 const isNetworkBlock = e => {
     const m = String((e === null || e === void 0 ? void 0 : e.message) || e);
     return m.includes("Failed to fetch") || m.includes("NetworkError") ||
@@ -380,47 +401,57 @@ const parseTrade = r => {
     const price = parseFloat(r.price || 0);
     const shares = parseFloat(r.size || 0);
     return {
-        id: r.transactionHash || `${r.proxyWallet}-${r.conditionId}-${r.timestamp}`,
-        addr: r.proxyWallet || "",
-        conditionId: r.conditionId || "",
+        id: g(r, "transaction_hash", "transactionHash") || `${g(r, "proxy_wallet", "proxyWallet")}-${g(r, "condition_id", "conditionId")}-${r.timestamp}`,
+        addr: g(r, "proxy_wallet", "proxyWallet") || "",
+        conditionId: g(r, "condition_id", "conditionId") || "",
         ts: tsToDate(r.timestamp),
         price, shares, cash: price * shares,
         side: (r.side || "BUY").toUpperCase(),
         outcome: r.outcome || "",
         title: r.title || "",
-        slug: r.slug || r.eventSlug || "",
+        slug: r.slug || g(r, "event_slug", "eventSlug") || "",
     };
 };
-// /closed-positions returns SETTLED positions — the half of a wallet's history
-// that /positions silently omits once a market is redeemed. Without it, a
+// status=CLOSED returns SETTLED positions — the half of a wallet's history
+// that the default OPEN view silently omits once a market is redeemed. Without it, a
 // 64-day-old account that has cashed out everything looks brand new.
+// v2 rows are snake_case; v1 was camelCase. Read both so a field can never
+// silently resolve to undefined and zero out a signal.
+const g = (r, snake, camel) => { const v = r[snake]; return v !== undefined ? v : r[camel]; };
 const parseClosedPosition = r => {
     var _a;
     return ({
-        conditionId: r.conditionId || "",
-        realizedPnl: parseFloat((_a = r.realizedPnl) !== null && _a !== void 0 ? _a : 0),
-        curPrice: r.curPrice != null ? parseFloat(r.curPrice) : null,
+        conditionId: g(r, "condition_id", "conditionId") || "",
+        realizedPnl: parseFloat((_a = g(r, "realized_pnl", "realizedPnl")) !== null && _a !== void 0 ? _a : 0),
+        curPrice: g(r, "current_price", "curPrice") != null ? parseFloat(g(r, "current_price", "curPrice")) : null,
         outcome: r.outcome || "",
-        oppositeOutcome: r.oppositeOutcome || "",
-        endDate: tsToDate(r.endDate),
-        closedAt: tsToDate(r.timestamp),
+        oppositeOutcome: g(r, "opposite_outcome", "oppositeOutcome") || "",
+        endDate: tsToDate(g(r, "end_date", "endDate")),
+        closedAt: tsToDate(g(r, "last_event_at", "timestamp")),
         title: r.title || "",
     });
 };
 const parsePosition = r => {
     var _a;
     return ({
-        conditionId: r.conditionId || "",
-        cashPnl: parseFloat((_a = r.cashPnl) !== null && _a !== void 0 ? _a : 0),
+        conditionId: g(r, "condition_id", "conditionId") || "",
+        cashPnl: parseFloat((_a = g(r, "unrealized_pnl", "cashPnl")) !== null && _a !== void 0 ? _a : 0),
         // MEASURED: a losing position can carry redeemable=true with curPrice=0 and a
         // negative cashPnl. So `redeemable` means THE MARKET RESOLVED — not that this
         // wallet won. Losers linger here unclaimed (nothing to claim); winners get
-        // redeemed and move to /closed-positions.
-        redeemable: !!r.redeemable,
-        curPrice: r.curPrice != null ? parseFloat(r.curPrice) : null,
+        // redeemed and move to the CLOSED status.
+        // v2 keeps the `redeemable` boolean AND adds `status`. Trust either:
+        // status is the wire truth (OPEN | REDEEMABLE | CLOSED), the flag is the
+        // v1-compatible shorthand. Both mean THE MARKET RESOLVED, not that this
+        // wallet won — losers linger here unclaimed with current_price 0.
+        redeemable: !!r.redeemable || r.status === "REDEEMABLE",
+        curPrice: g(r, "current_price", "curPrice") != null ? parseFloat(g(r, "current_price", "curPrice")) : null,
         outcome: r.outcome || "",
-        oppositeOutcome: r.oppositeOutcome || "",
-        endDate: tsToDate(r.endDate),
+        oppositeOutcome: g(r, "opposite_outcome", "oppositeOutcome") || "",
+        endDate: tsToDate(g(r, "end_date", "endDate")),
+        // v2 only: when this wallet first entered THIS market. The MIN across a
+        // wallet's positions is its first Polymarket activity — a real age proxy.
+        firstEntryAt: tsToDate(r.first_entry_at),
     });
 };
 // filters.mjs — SINGLE SOURCE OF TRUTH for market classification.
@@ -889,9 +920,13 @@ function App() {
             // Open AND settled history, fetched together. /positions alone shows only
             // what a wallet still HOLDS, so freshness / win-rate / the gambler
             // demotion were all reading a truncated view of reality.
+            // v2 folds /positions + /closed-positions into ONE route behind a
+            // status filter. Default status=OPEN already includes settled-but-
+            // unredeemed winners, so it is the direct replacement for v1
+            // /positions; status=CLOSED replaces /closed-positions.
             const [openRes, closedRes] = await Promise.allSettled([
-                jFetch(`${DA}/positions?user=${item.addr}&limit=${POS_LIMIT}`),
-                jFetch(`${DA}/closed-positions?user=${item.addr}&limit=${CLOSED_PAGE_CAP}&sortDirection=DESC`),
+                jFetchAll(`${DA}/v2/positions?user=${item.addr}`),
+                jFetchAll(`${DA}/v2/positions?user=${item.addr}&status=CLOSED`),
             ]);
             // DID the history actually arrive? An empty array and a failed call are
             // NOT the same thing, and the difference is not cosmetic: w.total=0 feeds
@@ -899,43 +934,25 @@ function App() {
             // dead positions endpoint silently awards every wallet the strongest
             // freshness score there is. Withhold instead — the same way a sampled
             // win rate is withheld rather than reported as a flattering fake.
-            const histOk = openRes.status === "fulfilled" && Array.isArray(openRes.value);
-            const positions = histOk ? openRes.value.map(parsePosition) : [];
-            let closedPositions = closedRes.status === "fulfilled" && Array.isArray(closedRes.value)
-                ? closedRes.value.map(parseClosedPosition) : [];
-            // If the best-50 page is full, the wallet has more settled history than one
-            // page shows. Pull the WORST 50 as well: if the two pages overlap at all,
-            // total settled <= 100 and we now hold the COMPLETE set. If they don't
-            // overlap, history is genuinely sampled and any win RATE would be fiction.
-            let closedComplete = histOk && closedPositions.length < CLOSED_PAGE_CAP;
-            if (!closedComplete) {
-                try {
-                    const worst = await jFetch(`${DA}/closed-positions?user=${item.addr}&limit=${CLOSED_PAGE_CAP}&sortDirection=ASC`);
-                    const asc = Array.isArray(worst) ? worst.map(parseClosedPosition) : [];
-                    const union = new Map();
-                    closedPositions.forEach(x => { if (x.conditionId)
-                        union.set(x.conditionId, x); });
-                    let overlap = 0;
-                    asc.forEach(x => {
-                        if (!x.conditionId)
-                            return;
-                        if (union.has(x.conditionId))
-                            overlap++;
-                        else
-                            union.set(x.conditionId, x);
-                    });
-                    closedPositions = [...union.values()];
-                    closedComplete = overlap > 0 || asc.length < CLOSED_PAGE_CAP;
-                }
-                catch ( /* keep the DESC page; stays marked sampled */_a) { /* keep the DESC page; stays marked sampled */ }
-            }
+            const histOk = openRes.status === "fulfilled" && Array.isArray(openRes.value.rows);
+            const positions = histOk ? openRes.value.rows.map(parsePosition) : [];
+            const closedOk = closedRes.status === "fulfilled" && Array.isArray(closedRes.value.rows);
+            const closedPositions = closedOk ? closedRes.value.rows.map(parseClosedPosition) : [];
+            // The v1 best-50 / worst-50 overlap trick is GONE. It existed only
+            // because v1 /closed-positions ignored limit>50 and sorted by
+            // realizedPnl DESC, so one page was a wallet's 50 BEST trades —
+            // 100% winners by construction. v2 pages by cursor to the true end,
+            // so the settled set is complete unless HARD_PAGE_CAP tripped. That
+            // un-withholds the win rate on exactly the heavily-traded wallets
+            // where it used to be suppressed.
+            const closedComplete = closedOk && closedRes.value.complete;
             // Settled = closed out + still-held-but-redeemable (won, unclaimed).
             const redeemables = positions.filter(p => p.redeemable);
             const resolvedCount = closedPositions.length + redeemables.length;
-            // wins is reliable EVEN when sampled: the DESC page holds the best trades,
-            // so if none of them are positive the wallet genuinely has no wins. That
-            // keeps the serial-gambler demotion working. The win RATE does not survive
-            // sampling, so it is withheld rather than reported as a flattering fake.
+            // wins is now counted over the COMPLETE settled set, so both the win
+            // rate and the serial-gambler demotion read real history. If
+            // HARD_PAGE_CAP ever trips, closedComplete goes false and the rate is
+            // withheld rather than reported as a flattering fake.
             const wins = closedPositions.filter(p => p.realizedPnl > 0).length
                 + redeemables.filter(p => p.cashPnl > 0).length;
             const pnl = positions.reduce((a, p) => a + (p.cashPnl || 0), 0)
@@ -962,7 +979,7 @@ function App() {
             // Truncation matters: past the page limit, win-rate / freshness / demotion
             // are computed on PARTIAL history, and the traded market may be missing
             // from byCondition (timing then fails open). Surfaced in the snapshot.
-            const truncated = positions.length >= POS_LIMIT || !closedComplete;
+            const truncated = !(openRes.status === "fulfilled" && openRes.value.complete) || !closedComplete;
             // Targeted recovery: when history is truncated AND the traded market fell
             // off the page, one extra call for THAT market restores its end date (and
             // therefore the timing signal). /positions supports a `market` filter of
@@ -970,20 +987,22 @@ function App() {
             if (truncated && !byCondition[item.conditionId] && !closedByCondition[item.conditionId]
                 && !marketEnd.current[item.conditionId]) {
                 try {
+                    // v2: `market` is a 400, `condition` replaces it.
                     const [o, c] = await Promise.allSettled([
-                        jFetch(`${DA}/positions?user=${item.addr}&market=${item.conditionId}`),
-                        jFetch(`${DA}/closed-positions?user=${item.addr}&market=${item.conditionId}`),
+                        jFetch(`${DA}/v2/positions?user=${item.addr}&condition=${item.conditionId}`),
+                        jFetch(`${DA}/v2/positions?user=${item.addr}&condition=${item.conditionId}&status=CLOSED`),
                     ]);
-                    if (o.status === "fulfilled" && Array.isArray(o.value))
-                        o.value.map(parsePosition).forEach(p => {
+                    const unwrap = j => Array.isArray(j) ? j : (Array.isArray(j === null || j === void 0 ? void 0 : j.data) ? j.data : null);
+                    if (o.status === "fulfilled" && unwrap(o.value))
+                        unwrap(o.value).map(parsePosition).forEach(p => {
                             if (!p.conditionId)
                                 return;
                             byCondition[p.conditionId] = p;
                             if (p.endDate)
                                 marketEnd.current[p.conditionId] = p.endDate;
                         });
-                    if (c.status === "fulfilled" && Array.isArray(c.value))
-                        c.value.map(parseClosedPosition).forEach(p => {
+                    if (c.status === "fulfilled" && unwrap(c.value))
+                        unwrap(c.value).map(parseClosedPosition).forEach(p => {
                             if (!p.conditionId)
                                 return;
                             closedByCondition[p.conditionId] = p;
@@ -1103,29 +1122,22 @@ function App() {
                 }
                 catch ( /* DB unreachable → direct fallback below */_a) { /* DB unreachable → direct fallback below */ }
             }
-            // ── Path B (fallback / politics-off): direct data-api fetch, paginated
-            // to the API's offset ceiling, de-duped by transaction hash.
+            // ── Path B (fallback / politics-off): direct data-api fetch, walked
+            // by cursor to a fixed depth, de-duped by transaction hash.
             if (src !== "db") {
-                // Pages fetched in PARALLEL (mirrors the collector). Past the API's
-                // offset ceiling pages come back empty or duplicated, which the
-                // id-dedup below absorbs — no sequential early-exit needed.
-                const PAGE = 500, OFFSETS = [0, 500, 1000, 1500];
-                const pages = await Promise.allSettled(OFFSETS.map(o => jFetch(`${DA}/trades?limit=${PAGE}&offset=${o}&takerOnly=true`)));
-                const raw = [];
-                const seenTx = new Set();
-                for (const res of pages) {
-                    const page = res.status === "fulfilled" && Array.isArray(res.value) ? res.value : [];
-                    for (const t of page) {
-                        const key = t.transactionHash || `${t.proxyWallet}-${t.conditionId}-${t.timestamp}`;
-                        if (!seenTx.has(key)) {
-                            seenTx.add(key);
-                            raw.push(t);
-                        }
-                    }
-                }
+                // v2 pages by CURSOR, so these must be walked in sequence —
+                // `offset` is a 400 on v2, not a silently-ignored parameter.
+                // Mirrors collector.mjs: 4 x 500 = the same ~2000-row depth.
+                const { rows: raw } = await jFetchAll(`${DA}/v2/trades?taker_only=true`, 4);
                 if (!raw.length)
-                    throw new Error("No trades returned from data-api.");
-                const fills = raw.map(parseTrade).filter(t => (t.side === "BUY" || t.side === "SELL") && t.addr && t.conditionId && t.cash > 0);
+                    throw new Error("No trades returned from data-api v2.");
+                // Cursors should not repeat a row, but a duplicate here would
+                // double-count a fill inside the per-wallet aggregation, so the
+                // v1 id-dedup stays.
+                const seenTx = new Set();
+                const fills = raw.map(parseTrade)
+                    .filter(t => (t.side === "BUY" || t.side === "SELL") && t.addr && t.conditionId && t.cash > 0)
+                    .filter(t => !seenTx.has(t.id) && seenTx.add(t.id));
                 kept = politicsOnlyR.current ? fills.filter(t => isRelevant(t.title)) : fills;
                 offTopic = fills.length - kept.length;
                 pulled = raw.length;
