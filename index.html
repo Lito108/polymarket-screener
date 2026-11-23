@@ -491,7 +491,7 @@ const parsePosition = r => {
 // Executive-change verbs are deliberately bound to an executive TITLE. A bare
 // "resign" or "step down" would re-admit every political resignation market
 // this rewrite just removed.
-const CORPORATE_RE = /\b(merger|merges?|merging|acquisition|acquires?|acquired|acquiring|takeover|buyout|LBO|tender offer|spin[- ]?offs?|divests?|divestiture|sells? a stake|stake sale|sold for|goes? private|taken private|IPOs?|direct listing|SPACs?|public offering|bankrupt|bankruptcies|bankruptcy|chapter 11|insolven\w*|liquidation|delist\w*|restructur\w*|defaults? on|earnings|revenues?|profit warning|dividends?|buybacks?|share repurchase|layoffs?|job cuts|funding round|series [a-f] round|valuation)s?\b|\b(resigns?|resigned|steps? down|stepping down|ousted?|fired|named|appointed|succeeds?)\s+(as\s+)?(the\s+)?(CEO|CFO|COO|CTO|chair|chairman|chairwoman|chief executive)\b|\b(CEO|CFO|chief executive)\b/i;
+const CORPORATE_RE = /\b(merger|merges?|merging|acquisition|acquires?|acquired|acquiring|takeover|buyout|LBO|tender offer|spin[- ]?offs?|divests?|divestiture|sells? a stake|stake sale|sold for|goes? private|taken private|IPOs?|direct listing|SPACs?|public offering|bankrupt|bankruptcies|bankruptcy|chapter 11|insolven\w*|liquidation|delist\w*|restructur\w*|defaults? on|earnings|revenues?|profit warning|dividends?|buybacks?|share repurchase|layoffs?|job cuts|funding round|series [a-f] round|valuation|resignation|removal|ouster|stepped aside|succession)s?\b|\b(resigns?|resigned|steps? down|stepping down|ousted?|fired|named|appointed|succeeds?)\s+(as\s+)?(the\s+)?(CEO|CFO|COO|CTO|chair|chairman|chairwoman|chief executive)\b|\b(CEO|CFO|chief executive)\b/i;
 
 // ── Allowlist 2: financial & market regulators ──────────────────────────────
 // This is also where the crypto carve-out lives: a spot-ETF approval or a
@@ -500,7 +500,27 @@ const CORPORATE_RE = /\b(merger|merges?|merging|acquisition|acquires?|acquired|a
 const REGFIN_RE = /\b(SEC|FTC|DOJ|CFTC|FINRA|FDIC|OCC|CFPB|FHFA|FASB|PCAOB|IRS|FDA|EMA|FCC|CMA|European Commission|antitrust|monopol\w*|consent decree|cease and desist|securities fraud|insider trading|class action|merger review|regulatory approval|approval|clearance|ETFs?|stablecoin|market structure bill|price[- ]fixing|accounting fraud|restatement|short[- ]seller report)s?\b/i;
 
 // ── Allowlist 3: macro & economic policy ────────────────────────────────────
-const MACRO_RE = /\b(fed|FOMC|federal reserve|interest rates?|rate (cut|hike|decision|change|rise)|powell|central bank|monetary policy|basis points|bps|quantitative (easing|tightening)|inflation|CPI|PCE|PPI|deflation|stagflation|recession|GDP|unemployment|jobless|nonfarm|payrolls?|jobs report|labor market|retail sales|consumer confidence|ISM|PMI|housing starts|debt ceiling|government shut ?downs?|shutdowns?|OPEC\+?|oil production (cut|quota)|production quota|federal budget|budget deficit|deficit|fiscal (policy|year|cliff)|tariffs?|trade deal|trade war|trade agreement|debt default|credit rating|downgrades?|sovereign debt|yield curve|treasury yields?|stimulus|bailout|minimum wage|bank of (england|japan|korea|canada|mexico|israel|india|brazil|china)|ECB|BOJ|PBOC|BOE)s?\b/i;
+// A bare "powell" used to match NVIDIA's Kimberly Powell. Requiring Fed
+// context in the same title keeps "Will Powell resign before his term ends?"
+// while dropping an unrelated person who happens to share the surname.
+const MACRO_RE = /\bpowell\b(?=[^?]*\b(fed|FOMC|interest|rate|monetary|chair|term)\b)|\b(fed|FOMC|federal reserve|interest rates?|rate (cut|hike|decision|change|rise)|jerome powell|fed chair|central bank|monetary policy|basis points|bps|quantitative (easing|tightening)|inflation|CPI|PCE|PPI|deflation|stagflation|recession|GDP|unemployment|jobless|nonfarm|payrolls?|jobs report|labor market|retail sales|consumer confidence|ISM|PMI|housing starts|debt ceiling|government shut ?downs?|shutdowns?|OPEC\+?|oil production (cut|quota)|production quota|federal budget|budget deficit|deficit|fiscal (policy|year|cliff)|tariffs?|trade deal|trade war|trade agreement|debt default|credit rating|downgrades?|sovereign debt|yield curve|treasury yields?|stimulus|bailout|minimum wage|bank of (england|japan|korea|canada|mexico|israel|india|brazil|china)|ECB|BOJ|PBOC|BOE)s?\b/i;
+
+// ── Veto 0: politics ────────────────────────────────────────────────────────
+// Scope is economics and finance, so anything electoral or governmental is out
+// regardless of which allowlist it tripped. This exists mainly so CORPORATE_RE
+// can accept a bare "resignation" — needed for "Jensen Huang announced
+// resignation or removal", which never says CEO — without re-admitting every
+// political resignation market. Residual gap: a title that names neither the
+// office nor any political word ("Will Theresa May resign before 2027?") still
+// slips through. Judged the better trade: missing an NVIDIA CEO market costs
+// far more than an occasional stray politician.
+//
+// Deliberately NOT vetoed: congress, senate, parliament, and party adjectives.
+// Legislatures pass financial law — "Will Congress pass the stablecoin bill?"
+// is a REGFIN market, and vetoing the institution would have killed the exact
+// crypto-regulatory carve-out that was asked for. Electoral words carry the
+// veto instead, since they are what actually marks a market as a horse race.
+const POLITICS_RE = /\b(president|presidential|presidency|prime minister|premier|mayor|mayoral|governor|gubernatorial|senator|election|electoral|ballot|referendum|primaries|nominee|nomination|incumbent|impeach\w*|caucus|party leader|wins? the \d{4}|\d{4} (democratic|republican) )s?\b/i;
 
 // ── Veto 1: game outcomes ───────────────────────────────────────────────────
 // Targets the SHAPE of a betting line, not league or team names — so that
@@ -515,7 +535,8 @@ const GAME_RE = /\b(vs\.?|versus)\b|\bO\/U\b|\bover\/under\b|\bspread:|\bmoneyli
 // $5B" is an acquisition price, not a quote, and must stay in — which is also
 // why CORPORATE_RE outranks this veto in isRelevant() below.
 const INDEX_RE = /\b(S&P ?500|S&P|Dow( Jones)?|Nasdaq|FTSE|Nikkei|DAX|CAC|Russell \d+|VIX)\b[^?]*\b(above|below|close[sd]?|end[s]? (above|below)|reach\w*|hit[s]?|top[s]?)\b/i;
-const PRICE_RE = /\bup or down\b|\ball[- ]time high\b|\bATH\b|\b(reach|reaches|hit|hits|top|tops|exceed|exceeds|surpass|surpasses|touch|touches|dip|dips|fall|falls|drop|drops|rise|rises|close|closes|trade|trades)\s+(to\s+|at\s+|above\s+|below\s+)?\$[\d,.]+/i;
+const HARD_PRICE_RE = /\bup or down\b|\ball[- ]time high\b|\bATH\b|\b(close[sd]?|closing|trade[sd]?|trading|settle[sd]?|finish(es|ed)?)\s+(above|below|under|over)\b/i;
+const PRICE_RE = /\b(reach|reaches|hit|hits|top|tops|exceed|exceeds|surpass|surpasses|touch|touches|dip|dips|fall|falls|drop|drops|rise|rises|close|closes|trade|trades)\s+(to\s+|at\s+|above\s+|below\s+)?\$[\d,.]+/i;
 
 // ── Decision ────────────────────────────────────────────────────────────────
 // Order matters:
@@ -526,6 +547,8 @@ const PRICE_RE = /\bup or down\b|\ball[- ]time high\b|\bATH\b|\b(reach|reaches|h
 const isRelevant = (title = "") => {
   if (!title) return false;
   if (GAME_RE.test(title)) return false;
+  if (POLITICS_RE.test(title)) return false;
+  if (HARD_PRICE_RE.test(title)) return false;   // quote language: no override
   const corporate = CORPORATE_RE.test(title);
   if (!corporate && (PRICE_RE.test(title) || INDEX_RE.test(title))) return false;
   return corporate || REGFIN_RE.test(title) || MACRO_RE.test(title);
